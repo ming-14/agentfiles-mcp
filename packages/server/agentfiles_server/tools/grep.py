@@ -10,8 +10,9 @@ from __future__ import annotations
 from agentfiles_shared.errors import ToolError
 from agentfiles_shared.schema import GrepInput
 
+from ..config import Config
 from ..fslayer import Resolver
 
 
-def execute(resolver: Resolver, params: GrepInput) -> tuple[dict, str]:
+def execute(resolver: Resolver, config: Config, params: GrepInput) -> tuple[dict, str]:
     raise ToolError("not_implemented", "grep is not implemented yet")

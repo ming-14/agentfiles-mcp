@@ -23,9 +23,11 @@ from agentfiles_shared.schema import (
     ReadInput,
     WriteInput,
 )
+from agentfiles_shared.transport import DownloadDescriptor
 
 from .client import RemoteError, ToolClient
 from .config import load as load_config
+from . import transport as file_transport
 
 _client: ToolClient | None = None
 
@@ -75,7 +77,24 @@ async def _call(tool: str, payload: dict[str, Any]) -> str:
         # FastMCP flattens any exception into `Error executing tool <name>:
         # <str(e)>`, which would drop ``exc.code``; carry it in the text.
         raise ToolError(exc.code, f"[{exc.code}] {exc.message}") from exc
+    if result.get("type") == "download":
+        return await _materialize(result, model_text)
     return _render(result, model_text)
+
+
+async def _materialize(result: dict[str, Any], model_text: str) -> str:
+    """Fetch a download descriptor into the local temp dir; return its path.
+
+    The model needs a local path it can hand to other tools, so the success
+    text and the path are returned together.
+    """
+    descriptor = DownloadDescriptor.model_validate(result)
+    try:
+        local = await file_transport.fetch(client(), descriptor)
+    except ToolError as exc:
+        raise ToolError(exc.code, f"[{exc.code}] {exc.message}") from exc
+    prefix = model_text or "File downloaded"
+    return f"{prefix}\n{local}"
 
 
 # Field definitions borrowed from the shared schema models (see module docstring).

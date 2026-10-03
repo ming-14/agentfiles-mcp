@@ -1,11 +1,16 @@
 """Server configuration from environment variables.
 
-AF_WORKSPACE      root directory the server may touch (mandatory)
-AF_TOKENS         JSON object mapping bearer token -> HMAC secret (mandatory)
-AF_ADDR           listen address, default 127.0.0.1:8443
-AF_TLS_CERT       path to PEM cert   (TLS termination can also be delegated to a proxy)
-AF_TLS_KEY        path to PEM key
-AF_MAX_SKEW       signature timestamp window in seconds, default 300
+AF_WORKSPACE           root directory the server may touch (mandatory)
+AF_TOKENS              JSON object mapping bearer token -> HMAC secret (mandatory)
+AF_ADDR                 listen address, default 127.0.0.1:8443
+AF_TLS_CERT             path to PEM cert   (TLS termination can also be delegated to a proxy)
+AF_TLS_KEY              path to PEM key
+AF_MAX_SKEW             signature timestamp window in seconds, default 300
+AF_EXTERNAL_WHITELIST   JSON array of directories allowed outside the workspace
+                        (default []: everything outside the workspace is rejected)
+AF_READ_DENY            JSON array of wildcard patterns that may never be read
+                        (default ["*.env", "*.env.*"])
+AF_TRANSPORT_MAX        max bytes for a single file transport, default 100MB
 """
 
 from __future__ import annotations
@@ -15,10 +20,26 @@ import os
 from dataclasses import dataclass, field
 
 from agentfiles_shared.auth import DEFAULT_MAX_SKEW
+from agentfiles_shared.transport import DEFAULT_TRANSPORT_MAX_BYTES
+
+DEFAULT_READ_DENY = ["*.env", "*.env.*"]
 
 
 class ConfigError(Exception):
     pass
+
+
+def _json_list(name: str, default: list[str]) -> list[str]:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return list(default)
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ConfigError(f"{name} is not valid JSON: {exc}") from exc
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise ConfigError(f"{name} must be a JSON array of strings")
+    return value
 
 
 @dataclass(frozen=True)
@@ -29,6 +50,9 @@ class Config:
     tls_cert: str | None = None
     tls_key: str | None = None
     max_skew: int = DEFAULT_MAX_SKEW
+    external_whitelist: list[str] = field(default_factory=list)
+    read_deny: list[str] = field(default_factory=lambda: list(DEFAULT_READ_DENY))
+    transport_max: int = DEFAULT_TRANSPORT_MAX_BYTES
 
     @property
     def tls_enabled(self) -> bool:
@@ -60,4 +84,11 @@ def load() -> Config:
         tls_cert=os.environ.get("AF_TLS_CERT") or None,
         tls_key=os.environ.get("AF_TLS_KEY") or None,
         max_skew=int(os.environ.get("AF_MAX_SKEW", DEFAULT_MAX_SKEW)),
+        external_whitelist=[
+            os.path.abspath(p) for p in _json_list("AF_EXTERNAL_WHITELIST", [])
+        ],
+        read_deny=_json_list("AF_READ_DENY", DEFAULT_READ_DENY),
+        transport_max=int(
+            os.environ.get("AF_TRANSPORT_MAX", str(DEFAULT_TRANSPORT_MAX_BYTES))
+        ),
     )

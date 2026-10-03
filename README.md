@@ -18,12 +18,12 @@ Agent ──stdio/MCP──▶ 本地 agentfiles-mcp ──HTTPS+Token+HMAC─�
 
 1. **TLS**：传输加密（服务端直挂证书，或由反向代理终结）
 2. **Bearer Token**：`AF_TOKENS` 配置 token → secret 映射，每次请求校验
-3. **HMAC-SHA256 签名**：防篡改 + 防重放
+3. **HMAC-SHA256 签名**：防篡改 + 防重放（query string 在签名内）
 
 签名规范：
 
 ```
-canonical = "v1\n{timestamp}\n{nonce}\n{METHOD}\n{path}\n{sha256_hex(body)}"
+canonical = "v1\n{timestamp}\n{nonce}\n{METHOD}\n{path}[?{query}]\n{sha256_hex(body)}"
 signature = hex(hmac_sha256(secret, canonical))
 
 Headers:
@@ -41,6 +41,27 @@ Headers:
 `unknown_token` → 时间戳 / nonce / 签名。签名头的存在性检查排在 token 查询之前，
 所以一个不带签名头的请求永远拿不到 `unknown_token`，无法据此枚举有效 token。
 
+### 文件传输（transport）
+
+工具响应**从不内联文件字节**——图片也不例外。`read` 到图片时返回下载描述符：
+
+```json
+{ "type": "download", "path": "/server/abs/path.png", "name": "path.png",
+  "mime": "image/png", "size": 1234 }
+```
+
+MCP 客户端再用带签名的 `GET /v1/transport/download?path=<path>` 拉取原始字节
+（query 在签名内，改 `path=` 会验签失败），落盘到本地 temp 目录后给模型返回：
+
+```
+Image read successfully
+<本地绝对路径>
+```
+
+图片**不做缩放、不做转码**，只做结构校验（PNG IEND / JPEG SOI+EOI / GIF 终止符 /
+WEBP RIFF 长度），损坏 → `Image could not be decoded: <resource>`，此时不会产生下载。
+单文件传输上限 `AF_TRANSPORT_MAX`（默认 100MB）。
+
 ## 服务端
 
 环境变量：
@@ -52,6 +73,9 @@ Headers:
 | `AF_ADDR` | | 监听地址，默认 `127.0.0.1:8443` |
 | `AF_TLS_CERT` / `AF_TLS_KEY` | | PEM 证书/私钥（启用内置 TLS） |
 | `AF_MAX_SKEW` | | 时间戳窗口秒数，默认 300 |
+| `AF_EXTERNAL_WHITELIST` | | JSON 数组，workspace 之外允许访问的目录，默认 `[]`（全拒） |
+| `AF_READ_DENY` | | JSON 数组，禁止读取的 wildcard，默认 `["*.env", "*.env.*"]` |
+| `AF_TRANSPORT_MAX` | | 单文件传输字节上限，默认 100MB |
 
 启动：
 
@@ -70,6 +94,7 @@ POST /v1/write   {path, content}
 POST /v1/edit    {path, oldString, newString, replaceAll?}
 POST /v1/glob    {pattern, path?, limit?}
 POST /v1/grep    {pattern, path?, include?, limit?}
+GET  /v1/transport/download?path=<abs>   拉取文件字节（query 参与签名）
 ```
 
 请求体必须是 JSON 对象，并按 `agentfiles_shared.schema` 的输入模型校验。
@@ -95,6 +120,7 @@ POST /v1/grep    {pattern, path?, include?, limit?}
 | `AF_URL` | 服务端基址，如 `https://files.example.com` |
 | `AF_TOKEN` / `AF_SECRET` | 该客户端的 token 与签名密钥 |
 | `AF_TIMEOUT` | 请求超时秒数，默认 30 |
+| `AF_TEMP_DIR` | 传输文件落地目录，默认 `<系统 temp>/agentfiles` |
 
 注册为 MCP 服务器（stdio 命令 `agentfiles-mcp`）：
 
@@ -146,18 +172,23 @@ python -m pytest -q
 ```
 packages/shared/agentfiles_shared/
   schema.py        工具输入/输出模型
-  auth.py          HMAC 签名构造与校验
+  auth.py          HMAC 签名构造与校验（canonical 含 query）
   nonce_cache.py   重放保护（内存 TTL 缓存）
+  wildcard.py      V2 语义的通配符匹配（AF_READ_DENY 复用）
+  transport.py     下载描述符与传输常量
   errors.py        模型可见错误文案（单一来源）
 packages/server/agentfiles_server/
-  app.py           FastAPI 装配
+  app.py           FastAPI 装配 + transport 路由
   middleware.py    认证链：bearer → 签名头 → token → 时间戳 → nonce → 签名 → 重放
-  config.py        环境变量配置
-  fslayer.py       路径解析 / 逃逸校验
+  config.py        环境变量配置（含白名单/黑名单/传输上限）
+  fslayer.py       路径解析 / 逃逸校验 / 外部白名单
+  readfs.py        read 引擎：嗅探、分页、目录列表、图片结构校验
+  transport.py     签名下载端点（containment + 大小校验）
   tools/           read write edit glob grep
 packages/mcp/agentfiles_mcp/
   server.py        FastMCP 工具定义（参数 schema 取自 shared/schema.py）
-  client.py        带签名的 HTTP 客户端
+  client.py        带签名的 HTTP 客户端（POST + 下载）
+  transport.py     下载落盘（temp 目录、.part 原子改名）
   config.py        环境变量配置
 tests/             单测 + 端到端
 ```

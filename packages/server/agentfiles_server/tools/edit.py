@@ -9,8 +9,9 @@ from __future__ import annotations
 from agentfiles_shared.errors import ToolError
 from agentfiles_shared.schema import EditInput
 
+from ..config import Config
 from ..fslayer import Resolver
 
 
-def execute(resolver: Resolver, params: EditInput) -> tuple[dict, str]:
+def execute(resolver: Resolver, config: Config, params: EditInput) -> tuple[dict, str]:
     raise ToolError("not_implemented", "edit is not implemented yet")

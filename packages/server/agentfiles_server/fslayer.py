@@ -1,22 +1,26 @@
 """Path resolution and containment (mirrors packages/core/src/location-mutation.ts).
 
-Rules to keep identical to V2:
+Rules kept identical to V2, plus a server-side external whitelist:
   * relative paths must not escape the workspace root (``relative_escape``)
   * symlinks must not resolve outside the root (``location_escape``)
+  * absolute paths outside the root are allowed only when they are inside a
+    directory listed in ``AF_EXTERNAL_WHITELIST`` (otherwise the resolve fails)
   * resources are always reported with forward slashes
 """
 
 from __future__ import annotations
 
 import os
+import posixpath
 from dataclasses import dataclass
 from pathlib import Path
 
-from agentfiles_shared.errors import path_escape
+from agentfiles_shared.errors import ToolError, path_escape
 
 REASON_RELATIVE_ESCAPE = "relative_escape"
 REASON_LOCATION_ESCAPE = "location_escape"
 REASON_NON_DIRECTORY_ANCESTOR = "non_directory_ancestor"
+REASON_EXTERNAL_DENIED = "external_directory"
 
 
 def slash(path: str) -> str:
@@ -30,6 +34,11 @@ def contains(parent: str, child: str) -> bool:
     return rel == "." or (not os.path.isabs(rel) and not rel.startswith(".."))
 
 
+def in_whitelist(path: str, whitelist: list[str]) -> bool:
+    """True when ``path`` is inside one of the whitelisted directories."""
+    return any(contains(directory, path) for directory in whitelist)
+
+
 @dataclass(frozen=True)
 class Resolved:
     canonical: str      # absolute, symlink-resolved
@@ -38,20 +47,23 @@ class Resolved:
 
 
 class Resolver:
-    def __init__(self, root: str) -> None:
+    def __init__(self, root: str, whitelist: list[str] | None = None) -> None:
         self.root = os.path.realpath(root)
+        self.whitelist = [os.path.realpath(p) for p in (whitelist or [])]
 
-    def resolve(self, path: str) -> Resolved:
+    def resolve(self, path: str, *, kind: str = "file") -> Resolved:
         """Resolve ``path`` against the workspace root.
 
-        Raises ToolError('path_escape') on relative escape / symlink escape.
+        Raises ToolError('path_escape') on relative escape, symlink escape, or
+        an external path that is not covered by the whitelist.
         """
         if os.path.isabs(path):
             lexical = os.path.normpath(path)
-            lexically_internal = contains(self.root, lexical)
-            if not lexically_internal:
-                # external absolute path: allowed, but caller must authorize it
+            if not contains(self.root, lexical):
+                # external absolute path: only whitelisted directories are readable
                 canonical = self._realpath_or_anchor(lexical)
+                if not in_whitelist(canonical, self.whitelist):
+                    raise path_escape(path, REASON_EXTERNAL_DENIED)
                 return Resolved(
                     canonical=canonical,
                     resource=slash(canonical),
@@ -59,12 +71,11 @@ class Resolver:
                 )
         else:
             lexical = os.path.normpath(os.path.join(self.root, path))
-            lexically_internal = contains(self.root, lexical)
-            if not lexically_internal:
+            if not contains(self.root, lexical):
                 raise path_escape(path, REASON_RELATIVE_ESCAPE)
 
         canonical = self._realpath_or_anchor(lexical)
-        if lexically_internal and not contains(self.root, canonical):
+        if not contains(self.root, canonical):
             raise path_escape(path, REASON_LOCATION_ESCAPE)
 
         rel = os.path.relpath(canonical, self.root)
@@ -86,5 +97,8 @@ class Resolver:
             raise path_escape(target, REASON_NON_DIRECTORY_ANCESTOR)
         resolved_anchor = os.path.realpath(str(anchor))
         remainder = os.path.relpath(target, str(anchor))
-        joined = os.path.normpath(os.path.join(resolved_anchor, remainder))
-        return joined
+        return os.path.normpath(os.path.join(resolved_anchor, remainder))
+
+
+def relative_to(root: str, absolute: str) -> str:
+    return slash(posixpath.relpath(slash(absolute), slash(root)))

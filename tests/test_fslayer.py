@@ -42,11 +42,31 @@ def test_relative_escape_rejected(workspace: Path):
     assert "relative_escape" in exc.value.message
 
 
-def test_external_absolute_marked_external(workspace: Path, tmp_path: Path):
+def test_external_absolute_rejected_without_whitelist(workspace: Path, tmp_path: Path):
     target = str(tmp_path / "outside.txt")
-    resolved = Resolver(str(workspace)).resolve(target)
+    with pytest.raises(ToolError) as exc:
+        Resolver(str(workspace)).resolve(target)
+    assert exc.value.code == "path_escape"
+    assert "external_directory" in exc.value.message
+
+
+def test_external_absolute_allowed_with_whitelist(workspace: Path, tmp_path: Path):
+    target = str(tmp_path / "outside.txt")
+    resolved = Resolver(str(workspace), [str(tmp_path)]).resolve(target)
     assert resolved.external
     assert resolved.resource == slash(target)
+
+
+def test_whitelist_is_prefix_scoped(workspace: Path, tmp_path: Path):
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    (allowed / "note.md").write_text("x")
+    other = tmp_path / "other"
+    other.mkdir()
+    resolver = Resolver(str(workspace), [str(allowed)])
+    assert resolver.resolve(str(allowed / "note.md")).external
+    with pytest.raises(ToolError):
+        resolver.resolve(str(other / "note.md"))
 
 
 def test_resource_uses_forward_slashes(workspace: Path):

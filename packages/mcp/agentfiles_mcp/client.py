@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import json
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
 from agentfiles_shared.auth import build_headers
 from agentfiles_shared.errors import ToolError
+from agentfiles_shared.transport import DOWNLOAD_PATH
 
 from .config import Config
 
@@ -50,6 +52,34 @@ class ToolClient:
 
     async def aclose(self) -> None:
         await self._http.aclose()
+
+    async def download(self, server_path: str) -> bytes:
+        """Signed GET /v1/transport/download?path=... returning raw bytes.
+
+        The query string is part of the canonical signature, so the target
+        path cannot be swapped after signing.
+        """
+        query = f"path={quote(server_path, safe='')}"
+        headers = build_headers(
+            token=self._config.token,
+            secret=self._config.secret,
+            method="GET",
+            path=DOWNLOAD_PATH,
+            body=b"",
+            query=query,
+        ).as_dict()
+
+        try:
+            response = await self._http.get(f"{DOWNLOAD_PATH}?{query}", headers=headers)
+        except httpx.HTTPError as exc:
+            raise RemoteError(f"download failed: {exc.__class__.__name__}") from exc
+
+        if response.status_code != 200:
+            error = _error_payload(response)
+            if error is None:
+                raise RemoteError(f"download returned HTTP {response.status_code}")
+            raise _tool_error(error, f"download returned HTTP {response.status_code}")
+        return response.content
 
     async def call(self, tool: str, payload: dict[str, Any]) -> tuple[dict, str]:
         """POST /v1/<tool> with signature headers; returns (result, modelText).

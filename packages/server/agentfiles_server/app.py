@@ -6,7 +6,7 @@ from collections.abc import Callable
 from typing import TypeVar
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, ValidationError
 from starlette.concurrency import run_in_threadpool
 
@@ -23,6 +23,7 @@ from .config import Config
 from .fslayer import Resolver
 from .middleware import AuthMiddleware, parse_body
 from .tools import edit, glob, grep, read, write
+from .transport import download
 
 MAX_ERROR_DETAILS = 5
 
@@ -44,7 +45,7 @@ def _validation_detail(exc: ValidationError) -> str:
 def create_app(config: Config) -> FastAPI:
     # Routes capture the resolver directly instead of reading it back off
     # app.state, so nothing depends on the ASGI lifespan having run.
-    resolver = Resolver(config.workspace)
+    resolver = Resolver(config.workspace, config.external_whitelist)
     app = FastAPI(title="agentfiles-server")
     app.add_middleware(AuthMiddleware, tokens=config.tokens, max_skew=config.max_skew)
 
@@ -54,7 +55,7 @@ def create_app(config: Config) -> FastAPI:
 
     def _tool(
         model: type[InputModel],
-        handler: Callable[[Resolver, InputModel], tuple[dict, str]],
+        handler: Callable[[Resolver, Config, InputModel], tuple[dict, str]],
     ):
         async def route(request: Request) -> JSONResponse:
             try:
@@ -62,7 +63,9 @@ def create_app(config: Config) -> FastAPI:
                 # Handlers are sync (file IO today, ripgrep subprocesses in
                 # step 5); run them off the event loop so they can't stall
                 # every other request.
-                structured, model_text = await run_in_threadpool(handler, resolver, params)
+                structured, model_text = await run_in_threadpool(
+                    handler, resolver, config, params
+                )
             except ToolError as exc:
                 return JSONResponse(
                     status_code=200,
@@ -99,5 +102,11 @@ def create_app(config: Config) -> FastAPI:
     app.post("/v1/edit")(_tool(EditInput, edit.execute))
     app.post("/v1/glob")(_tool(GlobInput, glob.execute))
     app.post("/v1/grep")(_tool(GrepInput, grep.execute))
+
+    @app.get("/v1/transport/download")
+    async def transport_download(path: str) -> Response:
+        # Signature (including the signed query) was verified by the middleware;
+        # FileResponse preparation is sync file IO, so keep it off the loop.
+        return await run_in_threadpool(download, resolver, config, path)
 
     return app

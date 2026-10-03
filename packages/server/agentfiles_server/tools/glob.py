@@ -9,8 +9,9 @@ from __future__ import annotations
 from agentfiles_shared.errors import ToolError
 from agentfiles_shared.schema import GlobInput
 
+from ..config import Config
 from ..fslayer import Resolver
 
 
-def execute(resolver: Resolver, params: GlobInput) -> tuple[dict, str]:
+def execute(resolver: Resolver, config: Config, params: GlobInput) -> tuple[dict, str]:
     raise ToolError("not_implemented", "glob is not implemented yet")

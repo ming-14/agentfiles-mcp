@@ -40,6 +40,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
                 secrets_for_token=self._tokens,
                 method=request.method,
                 path=path,
+                query=request.url.query,
                 body=body,
                 authorization=request.headers.get(HEADER_AUTHORIZATION),
                 timestamp=request.headers.get(HEADER_TIMESTAMP),

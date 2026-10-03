@@ -113,7 +113,7 @@ def test_replay_rejected(client):
     second = client.post("/v1/read", content=body, headers=headers)
     # first request authenticates and reaches the handler (200 + tool error)
     assert first.status_code == 200
-    assert first.json()["error"]["code"] == "not_implemented"
+    assert first.json()["error"]["code"] == "unable_to_read"
     # the identical nonce may not be reused
     assert second.status_code == 401
     assert second.json()["error"]["code"] == "replayed_nonce"
@@ -122,10 +122,10 @@ def test_replay_rejected(client):
 def test_signed_call_reaches_handler(client):
     """A valid signed request passes auth and reaches the tool handler."""
     resp = signed_post(client, "/v1/read", {"path": "x"})
-    assert resp.status_code == 200  # auth ok, handler raises not_implemented
+    assert resp.status_code == 200  # auth ok, handler reports missing file
     data = resp.json()
     assert data["ok"] is False
-    assert data["error"]["code"] == "not_implemented"
+    assert data["error"]["code"] == "unable_to_read"
 
 
 def test_malformed_json_body_is_invalid_input(client):
@@ -155,7 +155,7 @@ def test_out_of_range_field_is_invalid_input(client):
 
 def test_valid_input_reaches_handler(client):
     resp = raw_post(client, "/v1/read", b'{"path":"a","offset":1,"limit":10}')
-    assert resp.json()["error"]["code"] == "not_implemented"
+    assert resp.json()["error"]["code"] == "unable_to_read"
 
 
 def test_non_ascii_signature_is_unauthorized(client):
@@ -172,7 +172,7 @@ def test_routes_do_not_depend_on_lifespan(tmp_path):
     client = TestClient(app)  # deliberately not used as a context manager
     resp = signed_post(client, "/v1/read", {"path": "x"})
     assert resp.status_code == 200
-    assert resp.json()["error"]["code"] == "not_implemented"
+    assert resp.json()["error"]["code"] == "unable_to_read"
 
 
 async def test_httpx_client_keeps_server_error_code(tmp_path):
@@ -192,7 +192,7 @@ async def test_handler_runs_off_the_event_loop(tmp_path, monkeypatch):
     would be the event loop's own."""
     seen: dict[str, int] = {}
 
-    def stub_execute(resolver, params):
+    def stub_execute(resolver, config, params):
         seen["thread"] = threading.get_ident()
         return ({"matches": []}, "")
 
@@ -224,7 +224,7 @@ async def test_httpx_client_round_trip(tmp_path):
 
     with pytest.raises(ToolError) as exc:
         await tool_client.call("read", {"path": "x"})
-    assert exc.value.code == "not_implemented"
+    assert exc.value.code == "unable_to_read"
     await tool_client.aclose()
 
 

@@ -62,18 +62,20 @@ def body_hash(body: bytes) -> str:
 
 
 def canonical_string(
-    *, method: str, path: str, timestamp: str, nonce: str, body: bytes
+    *, method: str, path: str, timestamp: str, nonce: str, body: bytes, query: str = ""
 ) -> str:
+    target = f"{path}?{query}" if query else path
     return "\n".join(
-        [SIGNATURE_VERSION, timestamp, nonce, method.upper(), path, body_hash(body)]
+        [SIGNATURE_VERSION, timestamp, nonce, method.upper(), target, body_hash(body)]
     )
 
 
 def sign(
-    secret: str, *, method: str, path: str, timestamp: str, nonce: str, body: bytes
+    secret: str, *, method: str, path: str, timestamp: str, nonce: str, body: bytes,
+    query: str = "",
 ) -> str:
     message = canonical_string(
-        method=method, path=path, timestamp=timestamp, nonce=nonce, body=body
+        method=method, path=path, timestamp=timestamp, nonce=nonce, body=body, query=query
     ).encode("utf-8")
     return hmac.new(secret.encode("utf-8"), message, hashlib.sha256).hexdigest()
 
@@ -98,11 +100,13 @@ class SignedHeaders:
 
 def build_headers(
     *, token: str, secret: str, method: str, path: str, body: bytes,
-    timestamp: int | None = None, nonce: str | None = None,
+    query: str = "", timestamp: int | None = None, nonce: str | None = None,
 ) -> SignedHeaders:
     ts = str(int(time.time()) if timestamp is None else timestamp)
     n = nonce or new_nonce()
-    sig = sign(secret, method=method, path=path, timestamp=ts, nonce=n, body=body)
+    sig = sign(
+        secret, method=method, path=path, timestamp=ts, nonce=n, body=body, query=query
+    )
     return SignedHeaders(
         authorization=f"Bearer {token}",
         timestamp=ts,
@@ -130,6 +134,7 @@ def verify(
     timestamp: str | None,
     nonce: str | None,
     signature: str | None,
+    query: str = "",
     now: int | None = None,
     max_skew: int = DEFAULT_MAX_SKEW,
 ) -> str:
@@ -176,7 +181,8 @@ def verify(
         raise AuthError("bad_signature", "Signature verification failed")
 
     expected = sign(
-        secret, method=method, path=path, timestamp=timestamp, nonce=nonce, body=body
+        secret, method=method, path=path, timestamp=timestamp, nonce=nonce, body=body,
+        query=query,
     )
     if not hmac.compare_digest(expected, signature.lower()):
         raise AuthError("bad_signature", "Signature verification failed")

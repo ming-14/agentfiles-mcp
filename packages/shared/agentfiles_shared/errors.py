@@ -132,3 +132,14 @@ def path_escape(path: str, reason: str) -> ToolError:
 
 def unauthorized(detail: str = "Invalid or missing credentials") -> ToolError:
     return ToolError("unauthorized", detail)
+
+
+def transport_unavailable(path: str) -> ToolError:
+    return ToolError("transport_unavailable", f"File is no longer available: {path}")
+
+
+def transport_too_large(path: str, size: int, limit: int) -> ToolError:
+    return ToolError(
+        "transport_too_large",
+        f"File is {size} bytes, exceeding transport limit of {limit} bytes: {path}",
+    )
