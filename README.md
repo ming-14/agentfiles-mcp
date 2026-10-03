@@ -18,7 +18,9 @@ Agent ──stdio/MCP──▶ 本地 agentfiles-mcp ──HTTPS+Token+HMAC─�
 
 1. **TLS**：传输加密（服务端直挂证书，或由反向代理终结）
 2. **Bearer Token**：`AF_TOKENS` 配置 token → secret 映射，每次请求校验
-3. **HMAC-SHA256 签名**：防篡改 + 防重放（query string 在签名内）
+3. **HMAC-SHA256 签名**：防篡改 + 防重放（query string 在签名内）。签名**不承担授权**：
+   它由客户端用共享密钥生成，只证明请求者身份；能读什么由服务端的 containment
+   与 `AF_READ_DENY` 决定（见[文件传输](#文件传输transport)）。
 
 签名规范：
 
@@ -57,6 +59,11 @@ MCP 客户端再用带签名的 `GET /v1/transport/download?path=<path>` 拉取�
 Image read successfully
 <本地绝对路径>
 ```
+
+> **签名只证明"谁在请求"，不决定"能取什么"**。签名由客户端用共享密钥自己生成，
+> 持有密钥的一方可以为任意 `path` 签名，所以防越权不靠签名，而是靠端点里逐请求
+> 校验的两条服务端策略：containment（workspace + `AF_EXTERNAL_WHITELIST`）与
+> `AF_READ_DENY`——与 `read` 工具完全一致，被 deny 的文件无法绕过工具处理器取到。
 
 图片**不做缩放、不做转码**，只做结构校验（PNG IEND / JPEG SOI+EOI / GIF 终止符 /
 WEBP RIFF 长度），损坏 → `Image could not be decoded: <resource>`，此时不会产生下载。
@@ -108,8 +115,26 @@ GET  /v1/transport/download?path=<abs>   拉取文件字节（query 参与签名
 { "ok": false, "error": { "code": "...", "message": "..." } }
 ```
 
+`result` 用 `type` 判别（缺 `type` 即整文件内容）：
+
+| `type` | 含义 |
+|---|---|
+| `text-page` | 分页文本：`content` / `offset` / `truncated` / `next` |
+| `list-page` | 目录分页：`entries` / `truncated` / `next` |
+| `download` | 图片等二进制，改走 `/v1/transport/download` 取字节 |
+| （无） | 小文件全文：`uri` / `name` / `content` / `encoding` / `mime` |
+
 认证失败返回 `401`，响应体形状相同；`error.code` 是稳定值
 （`missing_authorization`、`unknown_token`、`bad_signature`…），客户端按它分流。
+
+`/v1/transport/download` 的非 200 状态（响应体形状同上）：
+
+| 状态 | 含义 |
+|---|---|
+| `400` | `path` 为空或不是绝对路径（`invalid_input`） |
+| `403` | containment 逃逸（`path_escape`）或命中 `AF_READ_DENY`（`unable_to_read`） |
+| `404` | 目标不存在或不是文件（`transport_unavailable`） |
+| `413` | 超过 `AF_TRANSPORT_MAX`（`transport_too_large`） |
 
 ## 本地 MCP
 
@@ -183,7 +208,7 @@ packages/server/agentfiles_server/
   config.py        环境变量配置（含白名单/黑名单/传输上限）
   fslayer.py       路径解析 / 逃逸校验 / 外部白名单
   readfs.py        read 引擎：嗅探、分页、目录列表、图片结构校验
-  transport.py     签名下载端点（containment + 大小校验）
+  transport.py     签名下载端点（containment + read-deny + 大小校验）
   tools/           read write edit glob grep
 packages/mcp/agentfiles_mcp/
   server.py        FastMCP 工具定义（参数 schema 取自 shared/schema.py）

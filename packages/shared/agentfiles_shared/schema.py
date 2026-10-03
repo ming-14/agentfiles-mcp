@@ -62,6 +62,9 @@ class Entry(BaseModel):
 
 
 class ListPage(BaseModel):
+    # V2's list result carries no tag; the type is added here so callers can
+    # discriminate results by ``type`` instead of by shape
+    type: Literal["list-page"] = "list-page"
     entries: list[Entry]
     truncated: bool
     next: Optional[int] = None

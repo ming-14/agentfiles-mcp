@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
 
 import httpx
 import pytest
@@ -67,7 +66,7 @@ async def test_fetch_writes_to_temp_and_returns_path(server, tmp_path, monkeypat
     local = await fetch(tool_client, descriptor)
     assert local.exists()
     assert local.read_bytes() == PNG
-    assert local.parent == temp_dir(str(tmp_path / "dl"))
+    assert local.parent == temp_dir()
     # deterministic name: same descriptor maps to the same local file
     again = await fetch(tool_client, descriptor)
     assert again == local

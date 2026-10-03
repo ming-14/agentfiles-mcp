@@ -46,18 +46,21 @@ def execute(
 def _run(
     resolver: Resolver, config: Config, params: ReadInput
 ) -> tuple[dict, str]:
-    target = resolver.resolve(params.path, kind="directory")
+    target = resolver.resolve(params.path)
     resource = target.resource
 
     # read-deny: match the same resource V2 would authorize (deny, no prompt)
     if any(wildcard_match(pattern, resource) for pattern in config.read_deny):
         raise unable_to_read(params.path)
 
-    kind = readfs.inspect(target.canonical)
+    kind = readfs.inspect(target.canonical, resource=resource)
 
     if kind == "directory":
         page = readfs.list_dir(
-            target.canonical, offset=params.offset, limit=params.limit
+            target.canonical,
+            resource=resource,
+            offset=params.offset,
+            limit=params.limit,
         )
         result = page.to_result()
         return result, _model_text(result)

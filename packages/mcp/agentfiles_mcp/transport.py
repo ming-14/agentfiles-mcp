@@ -22,9 +22,9 @@ from .client import ToolClient
 _SAFE_NAME = re.compile(r"[^A-Za-z0-9._-]+")
 
 
-def temp_dir(config_temp: str | None = None) -> Path:
+def temp_dir() -> Path:
     """AF_TEMP_DIR, else <system temp>/agentfiles."""
-    root = config_temp or os.environ.get("AF_TEMP_DIR", "").strip()
+    root = os.environ.get("AF_TEMP_DIR", "").strip()
     base = Path(root) if root else Path(tempfile.gettempdir()) / "agentfiles"
     base.mkdir(parents=True, exist_ok=True)
     return base

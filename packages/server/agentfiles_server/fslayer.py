@@ -11,11 +11,10 @@ Rules kept identical to V2, plus a server-side external whitelist:
 from __future__ import annotations
 
 import os
-import posixpath
 from dataclasses import dataclass
 from pathlib import Path
 
-from agentfiles_shared.errors import ToolError, path_escape
+from agentfiles_shared.errors import path_escape
 
 REASON_RELATIVE_ESCAPE = "relative_escape"
 REASON_LOCATION_ESCAPE = "location_escape"
@@ -30,7 +29,13 @@ def slash(path: str) -> str:
 
 def contains(parent: str, child: str) -> bool:
     """True when ``child`` is lexically inside ``parent`` (same rule as FSUtil.contains)."""
-    rel = os.path.relpath(child, parent)
+    try:
+        rel = os.path.relpath(child, parent)
+    except ValueError:
+        # Windows: relpath raises across drives ("path is on mount 'D:' ...").
+        # Another drive can never be inside this one, so containment simply
+        # fails -- the caller reports path_escape, never an exception.
+        return False
     return rel == "." or (not os.path.isabs(rel) and not rel.startswith(".."))
 
 
@@ -51,7 +56,7 @@ class Resolver:
         self.root = os.path.realpath(root)
         self.whitelist = [os.path.realpath(p) for p in (whitelist or [])]
 
-    def resolve(self, path: str, *, kind: str = "file") -> Resolved:
+    def resolve(self, path: str) -> Resolved:
         """Resolve ``path`` against the workspace root.
 
         Raises ToolError('path_escape') on relative escape, symlink escape, or
@@ -61,7 +66,7 @@ class Resolver:
             lexical = os.path.normpath(path)
             if not contains(self.root, lexical):
                 # external absolute path: only whitelisted directories are readable
-                canonical = self._realpath_or_anchor(lexical)
+                canonical = self._realpath_or_anchor(lexical, path)
                 if not in_whitelist(canonical, self.whitelist):
                     raise path_escape(path, REASON_EXTERNAL_DENIED)
                 return Resolved(
@@ -74,7 +79,7 @@ class Resolver:
             if not contains(self.root, lexical):
                 raise path_escape(path, REASON_RELATIVE_ESCAPE)
 
-        canonical = self._realpath_or_anchor(lexical)
+        canonical = self._realpath_or_anchor(lexical, path)
         if not contains(self.root, canonical):
             raise path_escape(path, REASON_LOCATION_ESCAPE)
 
@@ -83,8 +88,12 @@ class Resolver:
         return Resolved(canonical=canonical, resource=resource, external=False)
 
     @staticmethod
-    def _realpath_or_anchor(target: str) -> str:
-        """Resolve symlinks for the existing prefix; anchor on nearest existing dir."""
+    def _realpath_or_anchor(target: str, reported: str) -> str:
+        """Resolve symlinks for the existing prefix; anchor on nearest existing dir.
+
+        ``reported`` is how the caller spelled the path: errors echo it, so a
+        server-side absolute path never reaches a model-visible message.
+        """
         if os.path.exists(target):
             return os.path.realpath(target)
         anchor = Path(target)
@@ -94,11 +103,7 @@ class Resolver:
                 break
             anchor = parent
         if not anchor.is_dir():
-            raise path_escape(target, REASON_NON_DIRECTORY_ANCESTOR)
+            raise path_escape(reported, REASON_NON_DIRECTORY_ANCESTOR)
         resolved_anchor = os.path.realpath(str(anchor))
         remainder = os.path.relpath(target, str(anchor))
         return os.path.normpath(os.path.join(resolved_anchor, remainder))
-
-
-def relative_to(root: str, absolute: str) -> str:
-    return slash(posixpath.relpath(slash(absolute), slash(root)))

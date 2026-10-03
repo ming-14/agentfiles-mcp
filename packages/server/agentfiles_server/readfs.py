@@ -10,8 +10,10 @@ Differences from V2 (deliberate):
 from __future__ import annotations
 
 import codecs
+import locale
 import mimetypes
 import os
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -26,7 +28,9 @@ from agentfiles_shared.schema import (
 )
 from agentfiles_shared.transport import DownloadDescriptor
 
-# 31 binary extensions (V2 read-filesystem.ts)
+from .fslayer import contains
+
+# Binary extensions (V2 read-filesystem.ts). 28 entries; V2's header claims 31.
 BINARY_EXTENSIONS = {
     ".zip", ".tar", ".gz", ".exe", ".dll", ".so", ".class", ".jar", ".war",
     ".7z", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".odt", ".ods",
@@ -82,19 +86,30 @@ class ListPage:
     next: int | None = None
 
     def to_result(self) -> dict:
-        result = {"entries": self.entries, "truncated": self.truncated}
+        # every read result carries a `type` so callers can discriminate
+        # without shape-sniffing (V2's list result has none; see schema.ListPage)
+        result = {
+            "type": "list-page",
+            "entries": self.entries,
+            "truncated": self.truncated,
+        }
         if self.next is not None:
             result["next"] = self.next
         return result
 
 
-def inspect(path: str) -> str:
-    """Return "file" | "directory"; raise path_kind for anything else."""
+def inspect(path: str, resource: str | None = None) -> str:
+    """Return "file" | "directory"; raise path_kind for anything else.
+
+    ``resource`` is what goes into the error message (workspace-relative, so a
+    server path never leaks into a message other callers may surface);
+    ``path`` is only the filesystem location to inspect.
+    """
     if os.path.isfile(path):
         return "file"
     if os.path.isdir(path):
         return "directory"
-    raise path_kind(path, "a file or directory")
+    raise path_kind(resource if resource is not None else path, "a file or directory")
 
 
 def mime_type(path: str) -> str:
@@ -123,8 +138,20 @@ def image_mime(head: bytes) -> str | None:
     return None
 
 
+# The 30% non-printable ratio is only meaningful over a decent sample: paged
+# reads run is_binary() once per line segment, and a short segment of control
+# characters is normal text (log markers, escape sequences), not a binary file.
+# Below this size only the NUL byte disqualifies a sample.
+MIN_BINARY_SAMPLE_BYTES = 512
+
+
 def is_binary(resource: str, data: bytes) -> bool:
-    """V2 binary(): extension blacklist, NUL byte, >30% non-printable."""
+    """V2 binary(): extension blacklist, NUL byte, >30% non-printable.
+
+    The ratio rule is skipped for samples shorter than
+    ``MIN_BINARY_SAMPLE_BYTES`` (see the note above); everything else follows
+    V2.
+    """
     if os.path.splitext(resource)[1].lower() in BINARY_EXTENSIONS:
         return True
     if not data:
@@ -135,35 +162,48 @@ def is_binary(resource: str, data: bytes) -> bool:
             return True
         if byte < 9 or (13 < byte < 32):
             non_printable += 1
+    if len(data) < MIN_BINARY_SAMPLE_BYTES:
+        return False
     return non_printable / len(data) > 0.3
 
 
 # --- image validation (struct only, never modifies the file) -----------------
 
-def _validate_image(mime: str, data: bytes) -> bool:
+# Structural checks only look at the opening signature and the closing bytes
+# (PNG IEND / JPEG EOI / GIF terminator / RIFF length), so the trailer read
+# for them is this long -- a 20MB image never has to be read whole.
+IMAGE_TAIL_BYTES = 64
+
+
+def _validate_image(mime: str, head: bytes, tail: bytes, size: int) -> bool:
+    """Check image structure from ``head`` + ``tail`` + the real ``size``.
+
+    ``size`` carries the real file length; the slices are only ever inspected
+    for signature/trailer bytes, so neither of them needs the file's middle.
+    """
     if mime == "image/png":
-        if not data.startswith(b"\x89PNG\r\n\x1a\n") or len(data) < 8 + 25 + 12:
+        if not head.startswith(b"\x89PNG\r\n\x1a\n") or size < 8 + 25 + 12:
             return False
         # IHDR must be the first chunk, IEND must terminate the stream
-        if data[12:16] != b"IHDR":
+        if head[12:16] != b"IHDR":
             return False
-        return data.rfind(b"IEND") > 0 and data[-8:-4] == b"IEND"
+        return tail.rfind(b"IEND") > 0 and tail[-8:-4] == b"IEND"
     if mime == "image/jpeg":
-        if not data.startswith(b"\xff\xd8\xff"):
+        if not head.startswith(b"\xff\xd8\xff"):
             return False
-        if len(data) < 4 or not data.rstrip(b"\x00").endswith(b"\xff\xd9"):
+        if size < 4 or not tail.rstrip(b"\x00").endswith(b"\xff\xd9"):
             return False
         return True
     if mime == "image/gif":
-        if not data.startswith((b"GIF87a", b"GIF89a")):
+        if not head.startswith((b"GIF87a", b"GIF89a")):
             return False
-        return len(data) >= 14 and data[-1:] == b";"
+        return size >= 14 and tail[-1:] == b";"
     if mime == "image/webp":
-        if len(data) < 12 or data[:4] != b"RIFF" or data[8:12] != b"WEBP":
+        if size < 12 or head[:4] != b"RIFF" or head[8:12] != b"WEBP":
             return False
-        riff_size = int.from_bytes(data[4:8], "little")
+        riff_size = int.from_bytes(head[4:8], "little")
         # RIFF size counts bytes after the size field
-        return riff_size <= len(data) - 8 + 1
+        return riff_size <= size - 8 + 1
     return False
 
 
@@ -185,16 +225,16 @@ def read_file(
         if mime:
             if size > MAX_MEDIA_INGEST_BYTES:
                 raise media_ingest_limit(resource, MAX_MEDIA_INGEST_BYTES)
-            data = first + handle.read(MAX_MEDIA_INGEST_BYTES - len(first))
-            if len(data) > MAX_MEDIA_INGEST_BYTES:
-                raise media_ingest_limit(resource, MAX_MEDIA_INGEST_BYTES)
-            if not _validate_image(mime, data):
+            # only the trailer is needed for the structural check
+            handle.seek(max(0, size - IMAGE_TAIL_BYTES))
+            tail = handle.read(IMAGE_TAIL_BYTES)
+            if not _validate_image(mime, first, tail, size):
                 raise image_decode(resource)
             return DownloadDescriptor(
                 path=real,
                 name=os.path.basename(real),
                 mime=mime,
-                size=len(data),
+                size=size,
             )
 
         if first.startswith(b"%PDF") or os.path.splitext(resource)[1].lower() in BINARY_EXTENSIONS:
@@ -331,13 +371,45 @@ def _read_paged(handle, first: bytes, resource: str, real: str,
 
 # --- directory listing ---------------------------------------------------------
 
-def list_dir(absolute: str, *, offset: int | None, limit: int | None) -> ListPage:
-    """V2 list(): reject escaping symlinks, dirs first, locale-aware sort."""
-    import locale
+# ``locale.setlocale`` flips a process-global setting. list_dir runs on the
+# threadpool, so the switch, the sort and the restore are serialized here --
+# otherwise two concurrent listings interleave their locale switches, and every
+# other thread sharing the process sees the transient locale.
+_COLLATE_LOCK = threading.Lock()
 
+
+def _entry_key(entry: dict) -> tuple[int, str]:
+    return (0 if entry["type"] == "directory" else 1, entry["path"])
+
+
+def _sort_entries(entries: list[dict]) -> None:
+    """Dirs first, then the environment's locale collation of the name."""
+    with _COLLATE_LOCK:
+        previous: str | None = None
+        try:
+            previous = locale.setlocale(locale.LC_COLLATE)
+            locale.setlocale(locale.LC_COLLATE, "")
+            entries.sort(
+                key=lambda e: _entry_key(e) + (locale.strxfrm(e["path"]),)
+            )
+        except (locale.Error, TypeError):
+            entries.sort(key=_entry_key)
+        finally:
+            if previous is not None:
+                try:
+                    locale.setlocale(locale.LC_COLLATE, previous)
+                except locale.Error:
+                    pass
+
+
+def list_dir(absolute: str, *, offset: int | None, limit: int | None,
+             resource: str | None = None) -> ListPage:
+    """V2 list(): reject escaping symlinks, dirs first, locale-aware sort."""
     real = os.path.realpath(absolute)
     if not os.path.isdir(real):
-        raise path_kind(real, "a file or directory")
+        # report the resource, never the server-side absolute path
+        raise path_kind(resource if resource is not None else absolute,
+                        "a file or directory")
 
     entries: list[dict] = []
     for name in os.listdir(real):
@@ -359,12 +431,7 @@ def list_dir(absolute: str, *, offset: int | None, limit: int | None) -> ListPag
         suffix = os.sep if is_dir else ""
         entries.append({"path": name + suffix, "type": "directory" if is_dir else "file"})
 
-    try:
-        locale.setlocale(locale.LC_COLLATE, "")
-        entries.sort(key=lambda e: (0 if e["type"] == "directory" else 1,
-                                    locale.strxfrm(e["path"])))
-    except (locale.Error, TypeError):
-        entries.sort(key=lambda e: (0 if e["type"] == "directory" else 1, e["path"]))
+    _sort_entries(entries)
 
     start_offset = offset or 1
     page_limit = min(limit or MAX_READ_LINES, MAX_READ_LINES)
@@ -374,14 +441,9 @@ def list_dir(absolute: str, *, offset: int | None, limit: int | None) -> ListPag
     return ListPage(entries=selected, truncated=truncated, next=next_offset)
 
 
-def contains(parent: str, child: str) -> bool:
-    rel = os.path.relpath(child, parent)
-    return rel == "." or (not os.path.isabs(rel) and not rel.startswith(".."))
-
-
 __all__ = [
     "Content", "TextPage", "ListPage",
     "inspect", "read_file", "list_dir",
     "image_mime", "is_binary", "mime_type",
-    "BINARY_EXTENSIONS",
+    "BINARY_EXTENSIONS", "MIN_BINARY_SAMPLE_BYTES",
 ]

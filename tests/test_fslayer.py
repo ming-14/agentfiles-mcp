@@ -90,3 +90,29 @@ def test_contains_rule(tmp_path: Path):
     assert contains(parent, parent)
     assert contains(parent, str(tmp_path / "a" / "b"))
     assert not contains(parent, str(tmp_path / ".."))
+
+
+def test_contains_cross_drive_is_false_not_error():
+    """Windows relpath raises ValueError across drives; containment must just fail."""
+    if os.name != "nt":
+        pytest.skip("cross-drive paths only exist on Windows")
+    assert contains(r"C:\ws", r"D:\data\x.txt") is False
+    assert contains(r"D:\whitelist", r"C:\ws\x.txt") is False
+
+
+def test_cross_drive_absolute_path_is_path_escape():
+    """A path on another drive is external, so it fails as path_escape (never a
+    ValueError that the app would surface as `internal`)."""
+    if os.name != "nt":
+        pytest.skip("cross-drive paths only exist on Windows")
+    with pytest.raises(ToolError) as exc:
+        Resolver("C:/ws").resolve("D:/data/x.txt")
+    assert exc.value.code == "path_escape"
+
+
+def test_cross_drive_absolute_path_is_not_whitelisted():
+    if os.name != "nt":
+        pytest.skip("cross-drive paths only exist on Windows")
+    with pytest.raises(ToolError) as exc:
+        Resolver("C:/ws", ["C:/allowed"]).resolve("D:/data/x.txt")
+    assert exc.value.code == "path_escape"

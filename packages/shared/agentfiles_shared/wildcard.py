@@ -31,12 +31,3 @@ def compile_pattern(pattern: str) -> re.Pattern[str]:
 def match(pattern: str, value: str) -> bool:
     """True when ``value`` fully matches ``pattern``."""
     return compile_pattern(pattern).match(value.replace("\\", "/")) is not None
-
-
-def match_any(patterns: list[str], value: str) -> bool:
-    return any(match(p, value) for p in patterns)
-
-
-def match_glob_list(patterns: list[str], value: str) -> bool:
-    """V2-style: any pattern that matches ``value``."""
-    return match_any(patterns, value)

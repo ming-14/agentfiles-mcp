@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 from fastapi.testclient import TestClient
@@ -123,6 +124,16 @@ def test_paged_text(client, workspace):
     assert result["next"] == 5
 
 
+def test_paged_read_keeps_control_char_lines(client, workspace):
+    """Line segments are checked for binary content one at a time; a short
+    segment of control characters must not fail the whole paged read."""
+    make_text_file(workspace, "log.txt", "line one\n\x07\x07\x07ok\nline three\n")
+    assert read(client, "log.txt").json()["ok"] is True
+    data = read(client, "log.txt", offset=1, limit=10).json()
+    assert data["ok"] is True, data
+    assert data["result"]["content"] == "line one\n\x07\x07\x07ok\nline three"
+
+
 def test_large_file_is_paged_without_offset(client, workspace):
     lines = "\n".join("x" * 99 for _ in range(1000))  # ~100KB
     make_text_file(workspace, "huge.txt", lines + "\n")
@@ -168,12 +179,12 @@ def test_offset_zero_rejected(client, workspace):
 # --- directories -----------------------------------------------------------
 
 def test_directory_listing_sorted_dirs_first(client, workspace):
-    import os
-
     (workspace / "zdir").mkdir()
     (workspace / "adir").mkdir()
     make_text_file(workspace, "bfile.txt", "1")
     data = read(client, ".").json()
+    # every read result is tagged so clients can discriminate by `type`
+    assert data["result"]["type"] == "list-page"
     entries = data["result"]["entries"]
     # the workspace fixture also creates src/
     assert [e["type"] for e in entries[:3]] == ["directory", "directory", "directory"]
@@ -246,6 +257,16 @@ def test_relative_escape_rejected(client, workspace, tmp_path):
     assert data["error"]["code"] == "path_escape"
 
 
+def test_file_as_directory_reports_input_not_server_path(client, workspace):
+    """Errors echo what the caller sent; the workspace path stays server-side."""
+    make_text_file(workspace, "sub.txt", "x")
+    data = read(client, "sub.txt/inner").json()
+    assert data["error"]["code"] == "path_escape"
+    assert "non_directory_ancestor" in data["error"]["message"]
+    assert "sub.txt/inner" in data["error"]["message"]
+    assert str(workspace) not in data["error"]["message"]
+
+
 def test_whitelisted_external_path_allowed(tmp_path):
     ws = tmp_path / "ws"
     ws.mkdir()
@@ -261,6 +282,39 @@ def test_whitelisted_external_path_allowed(tmp_path):
         data = read(client, str(shared / "doc.md")).json()
     assert data["ok"] is True
     assert data["result"]["content"] == "# doc"
+
+
+def test_cross_drive_path_is_path_escape_not_internal(client, workspace):
+    """os.path.relpath raises across drives on Windows; the tool must report
+    path_escape instead of leaking an `internal` error."""
+    if os.name != "nt":
+        pytest.skip("cross-drive paths only exist on Windows")
+    home_drive = os.path.splitdrive(str(workspace))[0].upper()
+    other = "D:" if home_drive != "D:" else "E:"
+    data = read(client, f"{other}/data/x.txt").json()
+    assert data["ok"] is False
+    assert data["error"]["code"] == "path_escape"
+
+
+def test_cross_drive_link_filtered_from_listing(client, workspace, monkeypatch):
+    """A symlink resolving to another drive must be skipped by the listing,
+    not blow up list_dir (contains() used to raise ValueError)."""
+    if os.name != "nt":
+        pytest.skip("cross-drive paths only exist on Windows")
+    (workspace / "leak").mkdir()
+    home_drive = os.path.splitdrive(str(workspace))[0].upper()
+    other_drive = "D:" if home_drive != "D:" else "E:"
+    genuine = os.path.realpath
+
+    def realpath(path):
+        if str(path).endswith("leak"):
+            return other_drive + r"\leak-target"
+        return genuine(path)
+
+    monkeypatch.setattr("agentfiles_server.readfs.os.path.realpath", realpath)
+    data = read(client, ".").json()
+    assert data["ok"] is True, data
+    assert not any("leak" in entry["path"] for entry in data["result"]["entries"])
 
 
 # --- images: transport, never base64 ---------------------------------------
@@ -304,8 +358,6 @@ def test_transport_download_round_trip(client, workspace):
     png = tiny_png()
     (workspace / "pixel.png").write_bytes(png)
     read(client, "pixel.png")
-    import os
-
     server_path = os.path.realpath(workspace / "pixel.png")
     from urllib.parse import quote
 
@@ -325,8 +377,6 @@ def test_download_without_signature_rejected(client, workspace):
 def test_download_query_tamper_rejected(client, workspace):
     (workspace / "pixel.png").write_bytes(tiny_png())
     from urllib.parse import quote
-
-    import os
 
     real = os.path.realpath(workspace / "pixel.png")
     other = os.path.realpath(workspace / "hello.txt")
@@ -359,6 +409,69 @@ def test_download_outside_workspace_rejected(client, tmp_path):
         client, "/v1/transport/download", f"path={quote(str(outside), safe='')}"
     )
     assert resp.status_code == 403
+
+
+def test_download_read_deny_enforced(client, workspace):
+    """The transport endpoint must honour AF_READ_DENY: the signature only
+    proves who is asking, so a denied file can't be fetched around `read`."""
+    make_text_file(workspace, ".env", "SECRET=1")
+    from urllib.parse import quote
+
+    resp = signed_get(
+        client,
+        "/v1/transport/download",
+        f"path={quote(os.path.realpath(workspace / '.env'), safe='')}",
+    )
+    assert resp.status_code == 403
+    assert resp.json()["error"]["code"] == "unable_to_read"
+
+
+def test_download_requires_absolute_path(client, workspace):
+    """Descriptors carry absolute server paths; a relative one is a contract
+    violation (and would otherwise depend on the server's cwd)."""
+    (workspace / "pixel.png").write_bytes(tiny_png())
+    resp = signed_get(client, "/v1/transport/download", "path=pixel.png")
+    assert resp.status_code == 400
+    assert resp.json()["error"]["code"] == "invalid_input"
+
+
+def test_download_whitelisted_external_allowed(tmp_path):
+    """Containment goes through Resolver: whitelisted external files stay
+    downloadable, everything else is not."""
+    from urllib.parse import quote
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    (shared / "doc.md").write_text("# doc")
+    config = Config(
+        workspace=str(ws), tokens={TOKEN: SECRET}, external_whitelist=[str(shared)]
+    )
+    with TestClient(create_app(config)) as client:
+        resp = signed_get(
+            client,
+            "/v1/transport/download",
+            f"path={quote(str(shared / 'doc.md'), safe='')}",
+        )
+    assert resp.status_code == 200
+    assert resp.content == b"# doc"
+
+
+def test_download_cross_drive_is_rejected_not_500(client, workspace):
+    """containment across drives must fail as 403; contains() used to raise
+    ValueError here, which escaped the handler as a 500."""
+    if os.name != "nt":
+        pytest.skip("cross-drive paths only exist on Windows")
+    from urllib.parse import quote
+
+    home_drive = os.path.splitdrive(str(workspace))[0].upper()
+    other = "D:" if home_drive != "D:" else "E:"
+    resp = signed_get(
+        client, "/v1/transport/download", f"path={quote(other + '/data/x.txt', safe='')}"
+    )
+    assert resp.status_code == 403
+    assert resp.json()["error"]["code"] == "path_escape"
 
 
 def test_corrupt_png_rejected(client, workspace):
