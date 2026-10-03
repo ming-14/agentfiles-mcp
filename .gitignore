@@ -8,9 +8,6 @@ dist/
 .venv/
 venv/
 
-# uv
-uv.lock
-
 # 测试 / 覆盖率
 .pytest_cache/
 .coverage

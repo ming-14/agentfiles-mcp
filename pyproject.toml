@@ -1,12 +1,23 @@
 [project]
-name = "agentfiles-mcp"
+name = "agentfiles-mcp-workspace"
 version = "0.1.0"
 description = "Remote agent file tools: local MCP proxy + remote file server (V2 semantics)"
 requires-python = ">=3.11"
-dependencies = []
+# Umbrella: `uv sync` installs every member, so the root project doubles as
+# the dev environment (see README).
+dependencies = [
+    "agentfiles-shared",
+    "agentfiles-server",
+    "agentfiles-mcp",
+]
 
 [tool.uv.workspace]
 members = ["packages/*"]
+
+[tool.uv.sources]
+agentfiles-shared = { workspace = true }
+agentfiles-server = { workspace = true }
+agentfiles-mcp = { workspace = true }
 
 [dependency-groups]
 dev = [
@@ -21,3 +32,8 @@ testpaths = ["tests"]
 
 [tool.uv]
 package = false
+
+# 默认走国内镜像：本机直连 PyPI 不通。
+[[tool.uv.index]]
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+default = true
