@@ -495,3 +495,146 @@ def test_oversized_image_rejected(client, workspace, monkeypatch):
     (workspace / "big.png").write_bytes(tiny_png())
     data = read(client, "big.png").json()
     assert data["error"]["message"] == "Media exceeds 10 byte ingestion limit: big.png"
+
+
+# --- receipt provenance (read -> write/edit optimistic concurrency) ----------
+
+def test_receipt_comes_from_the_read_handle(client, workspace, monkeypatch):
+    """A file swapped after the read must not be handed a receipt for its
+    replacement. The marker is fstat() on the read handle, taken before the
+    bytes are pulled, so the follow-up write fails verification (fail-closed)
+    instead of overwriting content the model never saw."""
+    import agentfiles_server.readfs as readfs
+
+    (workspace / "a.txt").write_bytes(b"original\n")
+    real_read_file = readfs.read_file
+
+    def swapping(*args, **kwargs):
+        payload = real_read_file(*args, **kwargs)
+        # external writer replaces the file at the same path right after our
+        # read returns -- the window a path stat taken afterwards would cover
+        (workspace / "a.txt").write_bytes(b"SECRET THE MODEL NEVER SAW\n")
+        return payload
+
+    monkeypatch.setattr(readfs, "read_file", swapping)
+    version = read(client, "a.txt").json()["result"]["version"]
+
+    data = signed_post(client, "/v1/write", {
+        "path": "a.txt",
+        "content": "OVERWRITTEN\n",
+        "expectedVersion": version,
+    }).json()
+    assert data["ok"] is False
+    assert data["error"]["code"] == "version_mismatch"
+    assert (workspace / "a.txt").read_bytes() == b"SECRET THE MODEL NEVER SAW\n"
+
+
+def test_receipt_matches_content_under_a_concurrent_writer(client, workspace):
+    """Concurrency: a receipt may only ever authorize writing over content the
+    model actually read.
+
+    A writer thread keeps atomically replacing the file while we read and
+    write in a loop. Whenever a write passes verification, its receipt must
+    resolve to the very bytes the matching read returned -- the failure mode
+    of a receipt taken from a stat of the path after the read, which could
+    describe a file swapped in during that window (and would then verify as
+    "unchanged")."""
+
+    import threading
+
+    target = workspace / "racy.txt"
+    size = 4097  # constant length: only mtime/identity change between states
+    initial = b"start".ljust(size, b"x")
+    target.write_bytes(initial)
+    known: dict[tuple[int, int, int], bytes] = {}
+    with open(target, "rb") as handle:
+        stat = os.fstat(handle.fileno())
+    known[(stat.st_mtime_ns, stat.st_size, stat.st_ino)] = initial
+    stop = threading.Event()
+
+    def writer() -> None:
+        # replacements are atomic (temp + replace), so a reader always sees a
+        # whole generation; failures are just a lost race with an open handle
+        generation = 0
+        while not stop.is_set():
+            payload = (f"gen{generation:06d}" + "x" * size)[:size].encode()
+            generation += 1
+            tmp = workspace / "racy.tmp"
+            try:
+                with open(tmp, "wb") as handle:
+                    handle.write(payload)
+                    # buffered writes must reach the OS before the fstat, or
+                    # the recorded state (size/mtime) would not be the one the
+                    # reader later observes on the replaced file
+                    handle.flush()
+                    stat = os.fstat(handle.fileno())
+                known[(stat.st_mtime_ns, stat.st_size, stat.st_ino)] = payload
+                os.replace(tmp, target)
+            except OSError:
+                pass
+            # pace the generations: fast enough that a read/write round trip
+            # usually straddles a replacement, slow enough that some writes
+            # still land (otherwise the invariant below would never run)
+            stop.wait(0.003)
+
+    thread = threading.Thread(target=writer, daemon=True)
+    thread.start()
+    reads = writes = 0
+    try:
+        for _ in range(60):
+            read_back = read(client, "racy.txt").json()
+            if not read_back["ok"]:
+                # a replace landing on an open handle is a transient Windows
+                # sharing violation; it must still be a clean tool error
+                assert read_back["error"]["code"] == "unable_to_read", read_back
+                continue
+            reads += 1
+            content = read_back["result"]["content"].encode("utf-8")
+            receipt = read_back["result"]["version"]
+            outcome = signed_post(client, "/v1/write", {
+                "path": "racy.txt",
+                "content": "D" * size,
+                "expectedVersion": receipt,
+            }).json()
+            # clean tool errors only -- never an internal one
+            assert outcome["ok"] or outcome["error"]["code"] != "internal", outcome
+            if not outcome["ok"]:
+                # version_mismatch is the designed answer; a replace landing on
+                # our handle is a transient Windows sharing violation, which
+                # has to surface as a clean tool error all the same
+                assert outcome["error"]["code"] in ("version_mismatch",
+                                                    "unable_to_write"), outcome
+                continue
+            writes += 1
+            key = (receipt["mtimeNs"], receipt["size"], receipt["ino"])
+            assert known.get(key) == content, (
+                "the receipt did not describe the bytes that were read"
+            )
+            # our own write produced another state; record it for the next read
+            written = outcome["result"]["version"]
+            known[(written["mtimeNs"], written["size"], written["ino"])] = \
+                ("D" * size).encode()
+        assert reads >= 10, "the race loop barely ran; the invariant was not exercised"
+        assert writes >= 1, "no write ever passed verification; the invariant was not exercised"
+    finally:
+        stop.set()
+        thread.join(5)
+
+
+def test_filesystem_failure_reports_unable_to_read(client, workspace, monkeypatch):
+    """An OSError on the read path (permission, vanished file, I/O error)
+    becomes a tool error the model can act on -- never an `internal` one."""
+    import agentfiles_server.readfs as readfs
+
+    make_text_file(workspace, "a.txt", "content\n")
+
+    def boom(*args, **kwargs):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(readfs, "read_file", boom)
+    data = read(client, "a.txt").json()
+    assert data["ok"] is False
+    assert data["error"] == {
+        "code": "unable_to_read",
+        "message": "Unable to read a.txt",
+    }

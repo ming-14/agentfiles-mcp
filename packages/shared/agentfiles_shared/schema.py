@@ -15,6 +15,9 @@ from pydantic import BaseModel, Field
 
 MAX_READ_LINES = 2_000
 MAX_READ_BYTES = 50 * 1024
+# edit pulls the whole file into memory and diffs it, so it is bounded by its
+# own limit (read pages at MAX_READ_BYTES, which is far too small to edit with)
+MAX_EDIT_BYTES = 2 * 1024 * 1024
 MAX_LINE_LENGTH = 2_000
 MAX_LINE_SUFFIX = f"... (line truncated to {MAX_LINE_LENGTH} chars)"
 MAX_MEDIA_INGEST_BYTES = 20 * 1024 * 1024
@@ -31,11 +34,25 @@ class Version(BaseModel):
     Compared with fstat(2) on an open handle, never via a path stat, so a
     swapped file cannot pass verification. ``mtimeNs`` is integer nanoseconds
     (float mtimes lose precision on Windows).
+
+    ``ino``/``dev`` catch a replacement that kept both size and mtime -- on
+    exFAT and most network volumes mtime has second granularity, so a
+    same-length rewrite inside the same second is invisible to mtime+size.
+    They default to 0 (== "not supplied"), which skips the comparison, so a
+    marker minted by an older client still verifies exactly as before.
     """
 
     path: str = Field(description="Canonical absolute path on the server")
     mtime_ns: int = Field(alias="mtimeNs", description="st_mtime_ns of the file")
     size: int = Field(ge=0, description="Size in bytes")
+    ino: int = Field(
+        default=0, ge=0,
+        description="st_ino of the file (0 when the filesystem reports none)",
+    )
+    dev: int = Field(
+        default=0, ge=0,
+        description="st_dev (volume) the file lives on; pairs with ino",
+    )
 
     model_config = {"populate_by_name": True}
 

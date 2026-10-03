@@ -2,12 +2,14 @@
 
 Pure exact matching (V2 has no fuzzy chain either). Order:
   prechecks (no IO) -> resolve -> write-deny -> verified handle ->
-  re-stat after read -> count matches -> BOM/CRLF conversion -> CAS write.
+  decode -> re-check the pre-read fstat -> count matches ->
+  BOM/CRLF conversion -> CAS write.
 """
 
 from __future__ import annotations
 
 import difflib
+import os
 
 from agentfiles_shared.errors import (
     ToolError,
@@ -15,9 +17,16 @@ from agentfiles_shared.errors import (
     edit_identical,
     edit_multiple_matches,
     edit_not_found,
+    edit_too_large,
     unable_to_edit,
 )
-from agentfiles_shared.schema import EditInput
+from agentfiles_shared.schema import (
+    MAX_EDIT_BYTES,
+    MAX_LINE_LENGTH,
+    MAX_LINE_SUFFIX,
+    MAX_READ_BYTES,
+    EditInput,
+)
 from agentfiles_shared.wildcard import match as wildcard_match
 
 from .. import filemut
@@ -33,10 +42,14 @@ _TRANSPARENT_CODES = {
     "edit_empty_old",
     "edit_not_found",
     "edit_multiple_matches",
+    "edit_too_large",
 }
 
 PREVIEW_LINES = 6
 PREVIEW_LINE_CHARS = 240
+# The `patch` field travels with every edit, so it gets the same byte budget a
+# single read page has: one large file must not be echoed back through it.
+PATCH_MAX_BYTES = MAX_READ_BYTES
 
 
 def execute(
@@ -54,6 +67,10 @@ def execute(
         if exc.code in _TRANSPARENT_CODES:
             raise
         raise unable_to_edit(params.path) from None
+    except OSError:
+        # read-only file, vanished file, disk full -- on Windows a directory
+        # is PermissionError, not IsADirectoryError. Never an `internal` error.
+        raise unable_to_edit(params.path) from None
 
 
 def _run(resolver: Resolver, config: Config, params: EditInput) -> tuple[dict, str]:
@@ -65,6 +82,16 @@ def _run(resolver: Resolver, config: Config, params: EditInput) -> tuple[dict, s
         raise filemut.version_missing_edit()
 
     with filemut.target_lock(target.canonical):
+        # The limit has to be checked before the read: open_verified pulls the
+        # whole file into memory. A file that grows past the marker between
+        # here and the open fails _verify instead, so nothing slips through.
+        try:
+            size = os.path.getsize(target.canonical)
+        except OSError:
+            size = 0  # absent/unstatable: open_verified reports the real error
+        if size > MAX_EDIT_BYTES:
+            raise edit_too_large(params.path, size, MAX_EDIT_BYTES)
+
         handle = filemut.open_verified(
             target.canonical,
             params.expected_version,
@@ -72,13 +99,15 @@ def _run(resolver: Resolver, config: Config, params: EditInput) -> tuple[dict, s
             on_mismatch=filemut.version_mismatch_edit(),
             create=False,
         )
-        assert handle is not None
+        if handle is None:
+            # open_verified(create=False) never returns None; an explicit error
+            # rather than an assert, which `python -O` would strip
+            raise filemut.version_missing_edit()
         try:
-            stat_before_read = filemut.refstat(handle)
             text = _decode(handle.content, params.path)
-            # a change landing while we were reading invalidates the match set
-            filemut.verify_unchanged(handle, stat_before_read,
-                                     filemut.version_mismatch_edit())
+            # any change landing since the pre-read fstat (mid-read or while
+            # we were decoding) invalidates the match set
+            filemut.verify_unchanged(handle, filemut.version_mismatch_edit())
 
             ending = "\r\n" if "\r\n" in text else "\n"
             old = _to_ending(params.old_string, ending)
@@ -100,10 +129,11 @@ def _run(resolver: Resolver, config: Config, params: EditInput) -> tuple[dict, s
             had_bom = handle.had_bom
             out = replaced.encode("utf-8")
             filemut.modify(handle, filemut.join_bom(out, had_bom))
-        finally:
+        except BaseException:
             handle.close()
-
-        version = filemut.version_of_path(target.canonical)
+            raise
+        # marker from the handle we wrote through, before it closes
+        version = filemut.finish(handle)
 
     model_text = "\n".join(
         [
@@ -170,8 +200,23 @@ def _diff_counts(before: str, after: str) -> tuple[int, int]:
     return additions, deletions
 
 
+def _clip(line: str) -> str:
+    """Truncate a diff line exactly like the read tool truncates a file line."""
+    ending = "\n" if line.endswith("\n") else ""
+    body = line[:-1] if ending else line
+    if len(body) <= MAX_LINE_LENGTH:
+        return line
+    return body[:MAX_LINE_LENGTH] + MAX_LINE_SUFFIX + ending
+
+
 def _patch(resource: str, before: str, after: str) -> str:
-    return "".join(
+    """Unified diff for the model, bounded twice.
+
+    Long lines are clipped to MAX_LINE_LENGTH (a one-line megabyte file would
+    otherwise be echoed back in full), and the diff stops at PATCH_MAX_BYTES
+    with an explicit marker rather than silently returning a partial patch.
+    """
+    raw = list(
         difflib.unified_diff(
             before.splitlines(keepends=True),
             after.splitlines(keepends=True),
@@ -179,6 +224,23 @@ def _patch(resource: str, before: str, after: str) -> str:
             tofile=resource,
         )
     )
+    out: list[str] = []
+    used = 0
+    omitted = 0
+    for line in raw:
+        clipped = _clip(line)
+        size = len(clipped.encode("utf-8"))
+        if used + size > PATCH_MAX_BYTES and out:
+            omitted += 1
+            continue
+        out.append(clipped)
+        used += size
+    if omitted:
+        out.append(
+            f"... ({omitted} diff lines omitted; patch exceeds "
+            f"{PATCH_MAX_BYTES} bytes)\n"
+        )
+    return "".join(out)
 
 
 def _preview(value: str, prefix: str) -> list[str]:

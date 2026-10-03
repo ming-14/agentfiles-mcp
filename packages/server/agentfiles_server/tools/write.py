@@ -35,6 +35,10 @@ def execute(
         if exc.code in _TRANSPARENT_CODES:
             raise
         raise unable_to_write(params.path) from None
+    except OSError:
+        # os.open/os.write failures (read-only file, full disk, missing
+        # parent dir): a ToolError the model can act on, never `internal`
+        raise unable_to_write(params.path) from None
 
 
 def _deny(resource: str, config: Config, path: str) -> None:
@@ -66,12 +70,14 @@ def _run(
                 handle = filemut.create_with_dirs(target.canonical, data)
             else:
                 # exactly one BOM: old file had one, or the new content does
-                had_bom = handle.had_bom or data.startswith(b"\xef\xbb\xbf")
+                had_bom = handle.had_bom or filemut.has_bom(data)
                 filemut.modify(handle, filemut.join_bom(data, had_bom))
-        finally:
-            handle.close()
-
-        version = filemut.version_of_path(target.canonical)
+        except BaseException:
+            if handle is not None:
+                handle.close()
+            raise
+        # marker from the handle we wrote through, before it closes
+        version = filemut.finish(handle)
 
     verb = "Wrote" if existed else "Created"
     model_text = f"{verb} file successfully: {target.resource}"

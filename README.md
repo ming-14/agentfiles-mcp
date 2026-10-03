@@ -75,14 +75,27 @@ write/edit 采用**严格模式**：写入必须发生在通过校验的那个�
 不经过路径二次打开——检查与写入之间被替换的文件不可能收到数据。
 
 ```
-"version": { "path": "/abs/canonical", "mtimeNs": <st_mtime_ns>, "size": <bytes> }
+"version": {
+  "path": "/abs/canonical",
+  "mtimeNs": <st_mtime_ns>, "size": <bytes>,
+  "ino": <st_ino>, "dev": <st_dev>
+}
 ```
 
-- **read 文本成功**（含分页）→ 响应带 `version`，MCP 记入回执表
-- **write/edit 成功** → 返回**新** `version`，MCP 更新回执（连续修改无需重读）
+- **read 文本成功**（含分页）→ 响应带 `version`，MCP 记入回执表；标记取自
+  **读取句柄的 `fstat`（读之前）**，不是事后 stat 路径——读取到取标记之间被
+  换掉的文件拿不到凭据
+- **write/edit 成功** → 返回**新** `version`（关闭句柄前对该句柄 `fstat`），
+  MCP 更新回执（连续修改无需重读）
 - 图片 / 目录 / 读失败 → 不带 `version`（没有凭据）
 - write/edit 请求由 MCP 自动附带 `expectedVersion`；服务端用 `fstat(句柄)` 比对
-  `mtimeNs + size`，edit 还会在读取后二次 fstat（抓住读到一半被改）
+  `mtimeNs + size`，标记带 `ino/dev` 时再比对文件身份（同尺寸、同 mtime 的替换
+  也躲不掉）；edit 还会用**读取之前**取的基线 fstat 在解码后再校验一次
+  （抓住读到一半被改）
+- edit 超过 `MAX_EDIT_BYTES`（2MiB）→ `edit_too_large`；返回的 `patch` 逐行截断
+  到 2000 字符、总量超过 50KB 就截断并附省略说明
+- 权限 / 目录 / 磁盘满等文件系统错误 → `unable_to_read` / `unable_to_write` /
+  `unable_to_edit`，不会漏成 `internal`
 - 无回执 → `version_missing`（`Read the file before editing it.`）
 - 不符 → `version_mismatch`（`File changed since it was last read. ...`）
 - 回执表在 MCP 进程内存（LRU 512），**不落盘**：重启即失效，fail-closed
@@ -230,7 +243,7 @@ packages/server/agentfiles_server/
   config.py        环境变量配置（白名单 / 读黑名单 / 写黑名单 / 传输上限）
   fslayer.py       路径解析 / 逃逸校验 / 外部白名单
   filemut.py       严格模式句柄读写 + version 校验 + 目标锁 + BOM
-  readfs.py        read 引擎：嗅探、分页、目录列表、图片结构校验
+  readfs.py        read 引擎：嗅探、分页、目录列表、图片校验；文本回执在此取 fstat
   transport.py     签名下载端点（containment + read-deny + 大小校验）
   tools/           read write edit glob grep
 packages/mcp/agentfiles_mcp/

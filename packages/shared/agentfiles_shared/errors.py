@@ -98,6 +98,13 @@ def edit_multiple_matches() -> ToolError:
     )
 
 
+def edit_too_large(path: str, size: int, limit: int) -> ToolError:
+    return ToolError(
+        "edit_too_large",
+        f"File is {size} bytes, exceeding the {limit} byte edit limit: {path}",
+    )
+
+
 def edit_stale_content() -> ToolError:
     return ToolError(
         "edit_stale_content",

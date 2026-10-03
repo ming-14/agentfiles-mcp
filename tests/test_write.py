@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 
 import pytest
@@ -145,6 +146,31 @@ def test_bom_exactly_one_when_both(workspace):
     assert (workspace / "b.txt").read_bytes() == b"\xef\xbb\xbfafter"
 
 
+def test_write_content_starting_with_ef_keeps_bytes(workspace):
+    (workspace / "b.txt").write_bytes(b"\xef\xbb\xbfbefore")
+    with make_client(workspace) as client:
+        version = read_version(client, "b.txt")
+        write(client, "b.txt", "！after", version)
+    assert (workspace / "b.txt").read_bytes() == "\ufeff！after".encode()
+
+
+def test_write_content_starting_with_ef_into_bomless_file(workspace):
+    """No BOM in the old file: the leading 0xEF is content, not a marker."""
+    (workspace / "c.txt").write_bytes("！before\n".encode())
+    with make_client(workspace) as client:
+        version = read_version(client, "c.txt")
+        write(client, "c.txt", "！after\n", version)
+    assert (workspace / "c.txt").read_bytes() == "！after\n".encode()
+
+
+def test_write_ascii_into_cjk_leading_file_adds_no_bom(workspace):
+    (workspace / "c.txt").write_bytes("！before\n".encode())
+    with make_client(workspace) as client:
+        version = read_version(client, "c.txt")
+        write(client, "c.txt", "plain\n", version)
+    assert (workspace / "c.txt").read_bytes() == b"plain\n"
+
+
 # --- policy -----------------------------------------------------------------
 
 def test_write_deny_blocks_even_after_read(workspace):
@@ -209,3 +235,22 @@ def test_empty_content(workspace):
     assert data["ok"] is True
     assert (workspace / "empty.txt").read_bytes() == b""
     assert data["result"]["version"]["size"] == 0
+
+
+# --- filesystem failures -----------------------------------------------------
+
+def test_readonly_file_reports_unable_to_write(workspace):
+    """os.open(O_RDWR) raises PermissionError (not IsADirectoryError) on
+    Windows and for any read-only file; it must not leak as `internal`."""
+    target = workspace / "ro.txt"
+    target.write_bytes(b"content\n")
+    os.chmod(target, 0o444)
+    try:
+        with make_client(workspace) as client:
+            version = read_version(client, "ro.txt")
+            data = write(client, "ro.txt", "other\n", version)
+    finally:
+        os.chmod(target, 0o644)
+    assert data["error"]["code"] == "unable_to_write"
+    assert data["error"]["message"] == "Unable to write ro.txt"
+    assert target.read_bytes() == b"content\n"

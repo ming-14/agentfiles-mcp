@@ -25,9 +25,11 @@ from agentfiles_shared.schema import (
     MAX_MEDIA_INGEST_BYTES,
     MAX_READ_BYTES,
     MAX_READ_LINES,
+    Version,
 )
 from agentfiles_shared.transport import DownloadDescriptor
 
+from .filemut import version_of
 from .fslayer import contains
 
 # Binary extensions (V2 read-filesystem.ts). 28 entries; V2's header claims 31.
@@ -47,6 +49,9 @@ class Content:
     content: str
     encoding: str  # "utf8"
     mime: str
+    # write/edit receipt: fstat of the handle these bytes came from
+    # (images and directories grant none)
+    version: Version | None = None
 
     def to_result(self) -> dict:
         return {
@@ -65,6 +70,8 @@ class TextPage:
     offset: int
     truncated: bool
     next: int | None = None
+    # see Content.version: same receipt, same provenance (the read handle)
+    version: Version | None = None
 
     def to_result(self) -> dict:
         result = {
@@ -212,13 +219,22 @@ def _validate_image(mime: str, head: bytes, tail: bytes, size: int) -> bool:
 def read_file(
     absolute: str, resource: str, *, offset: int | None, limit: int | None
 ) -> Content | TextPage | DownloadDescriptor:
-    """V2 read(): image transport / full text / paged text."""
+    """V2 read(): image transport / full text / paged text.
+
+    Text results carry the write/edit receipt: an fstat of the handle the
+    bytes are read through, taken *before* the first read. A path stat taken
+    afterwards (or an fstat after the read) could describe a file swapped in
+    during the read, and that marker would then verify as "unchanged" for
+    content nobody ever saw.
+    """
     real = os.path.realpath(absolute)
     if not os.path.isfile(real):
         raise path_kind(resource, "a file")
 
-    size = os.path.getsize(real)
     with open(real, "rb") as handle:
+        # one fstat, before any read: receipt source and authoritative size
+        marker = version_of(handle.fileno(), absolute)
+        size = marker.size
         first = handle.read(min(64 * 1024, size or 4 * 1024))
 
         mime = image_mime(first)
@@ -262,13 +278,16 @@ def read_file(
                 content=text,
                 encoding="utf8",
                 mime=mime_type(real),
+                version=marker,
             )
 
-        return _read_paged(handle, first, resource, real, offset=offset, limit=limit)
+        return _read_paged(handle, first, resource, real, offset=offset,
+                           limit=limit, version=marker)
 
 
 def _read_paged(handle, first: bytes, resource: str, real: str,
-                *, offset: int | None, limit: int | None) -> TextPage:
+                *, offset: int | None, limit: int | None,
+                version: Version | None = None) -> TextPage:
     """V2's line pagination state machine (64KB chunks, strict UTF-8)."""
     start_offset = offset or 1
     page_limit = min(limit or MAX_READ_LINES, MAX_READ_LINES)
@@ -366,6 +385,7 @@ def _read_paged(handle, first: bytes, resource: str, real: str,
         offset=start_offset,
         truncated=next_line is not None,
         next=next_line,
+        version=version,
     )
 
 

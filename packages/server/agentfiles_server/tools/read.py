@@ -14,7 +14,6 @@ from agentfiles_shared.schema import ReadInput
 from agentfiles_shared.transport import DownloadDescriptor
 from agentfiles_shared.wildcard import match as wildcard_match
 
-from .. import filemut
 from .. import readfs
 from ..config import Config
 from ..fslayer import Resolver
@@ -41,6 +40,10 @@ def execute(
     except ToolError as exc:
         if exc.code in _TRANSPARENT_CODES:
             raise
+        raise unable_to_read(params.path) from None
+    except OSError:
+        # permission, a file vanishing between inspect and open, I/O error:
+        # a tool error the model can act on, never an `internal` one
         raise unable_to_read(params.path) from None
 
 
@@ -73,9 +76,11 @@ def _run(
         result = content.model_dump()
     else:
         result = content.to_result()
-        # text reads grant the write/edit receipt (images and directories do not)
-        version = filemut.version_of_path(target.canonical)
-        result["version"] = version.model_dump(by_alias=True)
+        # text reads grant the write/edit receipt (images and directories do
+        # not): the fstat of the handle these bytes came from, never a stat of
+        # the path taken afterwards
+        if content.version is not None:
+            result["version"] = content.version.model_dump(by_alias=True)
     return result, _model_text(result)
 
 
