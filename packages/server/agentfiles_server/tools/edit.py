@@ -7,9 +7,10 @@ CAS write (writeIfUnchanged) with per-target lock, diff preview text.
 from __future__ import annotations
 
 from agentfiles_shared.errors import ToolError
+from agentfiles_shared.schema import EditInput
 
 from ..fslayer import Resolver
 
 
-def execute(resolver: Resolver, payload: dict) -> tuple[dict, str]:
+def execute(resolver: Resolver, params: EditInput) -> tuple[dict, str]:
     raise ToolError("not_implemented", "edit is not implemented yet")

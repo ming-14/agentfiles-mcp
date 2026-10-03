@@ -7,9 +7,10 @@ TODO(step 5): ripgrep `--no-config --files --glob=<p> --glob=!**/.git/** .`
 from __future__ import annotations
 
 from agentfiles_shared.errors import ToolError
+from agentfiles_shared.schema import GlobInput
 
 from ..fslayer import Resolver
 
 
-def execute(resolver: Resolver, payload: dict) -> tuple[dict, str]:
+def execute(resolver: Resolver, params: GlobInput) -> tuple[dict, str]:
     raise ToolError("not_implemented", "glob is not implemented yet")

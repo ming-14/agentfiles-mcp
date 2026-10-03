@@ -1,7 +1,7 @@
 """Bounded in-memory nonce cache (replay protection).
 
-Single-instance by design: entries expire after ``max_skew`` seconds, so the
-cache only needs to remember nonces inside the accepted timestamp window.
+Single-instance by design: entries only need to live as long as the accepted
+timestamp window (see ``nonce_ttl``), so the cache stays small.
 """
 
 from __future__ import annotations
@@ -10,6 +10,17 @@ import time
 from collections import OrderedDict
 
 from .auth import AuthError
+
+
+def nonce_ttl(max_skew: int) -> int:
+    """How long a replay entry must be remembered for a ``±max_skew`` window.
+
+    The window is around the *signed* timestamp, not around arrival time, so
+    ``ttl=max_skew`` lets an entry expire while its timestamp is still accepted
+    whenever the client clock runs ahead of the server. Doubling covers both
+    ends of the window.
+    """
+    return max_skew * 2
 
 
 class NonceCache:

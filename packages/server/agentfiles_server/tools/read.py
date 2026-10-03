@@ -7,9 +7,10 @@ directory listing with symlink escape rejection, model-text rendering.
 from __future__ import annotations
 
 from agentfiles_shared.errors import ToolError
+from agentfiles_shared.schema import ReadInput
 
 from ..fslayer import Resolver
 
 
-def execute(resolver: Resolver, payload: dict) -> tuple[dict, str]:
+def execute(resolver: Resolver, params: ReadInput) -> tuple[dict, str]:
     raise ToolError("not_implemented", "read is not implemented yet")

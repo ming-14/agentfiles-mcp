@@ -7,7 +7,7 @@ Canonical string:
 Headers:
     Authorization: Bearer <token>
     X-Timestamp:   <unix seconds>
-    X-Nonce:       <32 hex chars>
+    X-Nonce:       <8-128 hex chars>   (clients send 32: secrets.token_hex(16))
     X-Signature:   <hex hmac-sha256>
 """
 
@@ -16,12 +16,15 @@ from __future__ import annotations
 import hashlib
 import hmac
 import secrets
+import string
 import time
 from dataclasses import dataclass
 
 SIGNATURE_VERSION = "v1"
 DEFAULT_MAX_SKEW = 300  # seconds
 NONCE_BYTES = 16
+NONCE_MIN_LENGTH = 8
+NONCE_MAX_LENGTH = 128
 
 HEADER_AUTHORIZATION = "authorization"
 HEADER_TIMESTAMP = "X-Timestamp"
@@ -36,6 +39,18 @@ class AuthError(Exception):
         super().__init__(message)
         self.code = code
         self.message = message
+
+
+_HEX_DIGITS = frozenset(string.hexdigits)
+
+
+def is_hex(value: str) -> bool:
+    """True for a non-empty ASCII hex string.
+
+    ``hmac.compare_digest`` raises ``TypeError`` when either operand is a
+    non-ASCII ``str``, so every header that reaches it must be screened first.
+    """
+    return bool(value) and all(char in _HEX_DIGITS for char in value)
 
 
 def new_nonce() -> str:
@@ -141,8 +156,19 @@ def verify(
     current = int(time.time()) if now is None else now
     if abs(current - ts) > max_skew:
         raise AuthError("stale_timestamp", "Request timestamp outside allowed window")
-    if len(nonce) < 8 or len(nonce) > 128:
-        raise AuthError("invalid_nonce", "X-Nonce has invalid length")
+    if (
+        len(nonce) < NONCE_MIN_LENGTH
+        or len(nonce) > NONCE_MAX_LENGTH
+        or not is_hex(nonce)
+    ):
+        raise AuthError(
+            "invalid_nonce",
+            f"X-Nonce must be {NONCE_MIN_LENGTH}-{NONCE_MAX_LENGTH} hex characters",
+        )
+
+    if not is_hex(signature):
+        # screened before compare_digest, which rejects non-ASCII str operands
+        raise AuthError("bad_signature", "Signature verification failed")
 
     expected = sign(
         secret, method=method, path=path, timestamp=timestamp, nonce=nonce, body=body

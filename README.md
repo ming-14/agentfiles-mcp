@@ -28,10 +28,14 @@ signature = hex(hmac_sha256(secret, canonical))
 
 Headers:
   Authorization: Bearer <token>
-  X-Timestamp:   <unix 秒>          允许偏差 ±300s
-  X-Nonce:       <32 hex 字符>       300s 内不可重复
-  X-Signature:   <hex>
+  X-Timestamp:   <unix 秒>              允许偏差 ±300s
+  X-Nonce:       <8-128 位 hex>         在 ±300s 窗口内不可重复
+  X-Signature:   <hex hmac-sha256>
 ```
+
+`X-Nonce` / `X-Signature` 必须是十六进制字符：非 hex（含非 ASCII）在比对前即被拒，
+不会进到 `hmac.compare_digest`。重放缓存的保留时长是 `2 × AF_MAX_SKEW`（默认 600s），
+覆盖整个 ±skew 窗口，避免客户端时钟超前时 nonce 先于时间戳窗口过期。
 
 ## 服务端
 
@@ -63,6 +67,10 @@ POST /v1/edit    {path, oldString, newString, replaceAll?}
 POST /v1/glob    {pattern, path?, limit?}
 POST /v1/grep    {pattern, path?, include?, limit?}
 ```
+
+请求体必须是 JSON 对象，并按 `agentfiles_shared.schema` 的输入模型校验。
+非 JSON、非对象、缺字段或字段越界一律返回 `error.code = invalid_input`
+（`message` 会给出具体字段），而不是 500。
 
 响应：
 

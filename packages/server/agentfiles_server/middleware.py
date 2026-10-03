@@ -9,13 +9,15 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
 
 from agentfiles_shared.auth import (
+    HEADER_AUTHORIZATION,
     HEADER_NONCE,
     HEADER_SIGNATURE,
     HEADER_TIMESTAMP,
     AuthError,
     verify,
 )
-from agentfiles_shared.nonce_cache import NonceCache
+from agentfiles_shared.errors import invalid_input
+from agentfiles_shared.nonce_cache import NonceCache, nonce_ttl
 
 SIGNED_PREFIX = "/v1/"
 
@@ -39,14 +41,14 @@ class AuthMiddleware(BaseHTTPMiddleware):
                 method=request.method,
                 path=path,
                 body=body,
-                authorization=request.headers.get("authorization"),
+                authorization=request.headers.get(HEADER_AUTHORIZATION),
                 timestamp=request.headers.get(HEADER_TIMESTAMP),
                 nonce=request.headers.get(HEADER_NONCE),
                 signature=request.headers.get(HEADER_SIGNATURE),
                 max_skew=self._max_skew,
             )
             nonce = request.headers[HEADER_NONCE]
-            self._nonces.check_and_store(nonce, ttl=self._max_skew)
+            self._nonces.check_and_store(nonce, ttl=nonce_ttl(self._max_skew))
         except AuthError as exc:
             return JSONResponse(
                 status_code=401,
@@ -60,8 +62,18 @@ class AuthMiddleware(BaseHTTPMiddleware):
 
 
 def parse_body(request: Request) -> dict:
-    """Read the JSON body stashed by the middleware (or parse it if absent)."""
+    """Read the JSON object the auth middleware stashed on the request.
+
+    Raises ``ToolError('invalid_input')`` -- never a bare ``JSONDecodeError`` --
+    so a malformed body reaches the model as a tool error instead of a 500.
+    """
     cached: bytes | None = getattr(request.state, "body", None)
-    if cached:
-        return json.loads(cached or b"{}")
-    return {}
+    if not cached:
+        return {}
+    try:
+        data = json.loads(cached)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise invalid_input(f"body is not valid JSON: {exc}") from exc
+    if not isinstance(data, dict):
+        raise invalid_input("body must be a JSON object")
+    return data
