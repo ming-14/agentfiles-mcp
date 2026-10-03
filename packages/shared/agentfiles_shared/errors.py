@@ -6,8 +6,6 @@ so that the remote server emits messages identical to what the model expects.
 
 from __future__ import annotations
 
-from typing import NoReturn
-
 
 class ToolError(Exception):
     """A tool failure whose message is shown verbatim to the model."""
@@ -19,10 +17,6 @@ class ToolError(Exception):
 
     def to_payload(self) -> dict[str, str]:
         return {"code": self.code, "message": self.message}
-
-
-def fail(code: str, message: str) -> NoReturn:
-    raise ToolError(code, message)
 
 
 # --- read -----------------------------------------------------------------
@@ -138,12 +132,3 @@ def path_escape(path: str, reason: str) -> ToolError:
 
 def unauthorized(detail: str = "Invalid or missing credentials") -> ToolError:
     return ToolError("unauthorized", detail)
-
-
-# --- V2 model-visible "generic" wrappers ---------------------------------
-
-def wrap_unreadable(path: str, exc: Exception) -> ToolError:
-    """V2 maps unexpected read failures to `Unable to read <input path>`."""
-    if isinstance(exc, ToolError):
-        return exc
-    return unable_to_read(path)

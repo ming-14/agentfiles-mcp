@@ -139,15 +139,20 @@ def verify(
     The caller is responsible for nonce replay caching (see ``nonce_cache.py``).
     """
     token = _bearer_token(authorization)
-    secret = secrets_for_token.get(token)
-    if secret is None:
-        raise AuthError("unknown_token", "Unknown bearer token")
 
+    # Header presence is checked before the token lookup: otherwise an
+    # unsigned request could tell unknown_token from missing_signature_headers
+    # (i.e. probe which tokens exist) by watching which error comes back.
     if timestamp is None or nonce is None or signature is None:
         raise AuthError(
             "missing_signature_headers",
             "Missing X-Timestamp, X-Nonce or X-Signature header",
         )
+
+    secret = secrets_for_token.get(token)
+    if secret is None:
+        raise AuthError("unknown_token", "Unknown bearer token")
+
     try:
         ts = int(timestamp)
     except ValueError:

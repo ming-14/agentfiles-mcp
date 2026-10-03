@@ -3,14 +3,20 @@
 from __future__ import annotations
 
 import json
+import threading
 
+import httpx
 import pytest
+import respx
 from fastapi.testclient import TestClient
 
-from agentfiles_mcp.client import ToolClient
+from agentfiles_mcp.client import RemoteError, ToolClient
 from agentfiles_mcp.config import Config as ClientConfig
 from agentfiles_server.app import create_app
 from agentfiles_server.config import Config as ServerConfig
+from agentfiles_server.tools import glob as glob_tool
+from agentfiles_shared.auth import build_headers
+from agentfiles_shared.errors import ToolError
 
 TOKEN = "tok-e2e"
 SECRET = "sec-e2e"
@@ -28,8 +34,6 @@ def client(tmp_path):
 
 
 def signed_post(client: TestClient, path: str, payload: dict, *, token=TOKEN, secret=SECRET):
-    from agentfiles_shared.auth import build_headers
-
     body = json.dumps(payload, separators=(",", ":")).encode()
     headers = build_headers(
         token=token, secret=secret, method="POST", path=path, body=body
@@ -40,8 +44,6 @@ def signed_post(client: TestClient, path: str, payload: dict, *, token=TOKEN, se
 
 def raw_post(client: TestClient, path: str, raw: bytes, *, signature=None):
     """Post a pre-serialized (possibly invalid) body with valid signature headers."""
-    from agentfiles_shared.auth import build_headers
-
     headers = build_headers(
         token=TOKEN, secret=SECRET, method="POST", path=path, body=raw
     ).as_dict()
@@ -49,6 +51,22 @@ def raw_post(client: TestClient, path: str, raw: bytes, *, signature=None):
         headers["X-Signature"] = signature
     headers["Content-Type"] = "application/json"
     return client.post(path, content=raw, headers=headers)
+
+
+def _asgi_client(app, *, secret: str = SECRET) -> ToolClient:
+    """ToolClient wired to a FastAPI app without touching the network."""
+    tool_client = ToolClient(
+        ClientConfig(url="http://testserver", token=TOKEN, secret=secret)
+    )
+    tool_client._http = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://testserver"
+    )
+    return tool_client
+
+
+def _bare_client() -> ToolClient:
+    """ToolClient pointed at a URL that only respx answers."""
+    return ToolClient(ClientConfig(url="http://testserver", token=TOKEN, secret=SECRET))
 
 
 def test_healthz_no_signature_needed(client):
@@ -74,8 +92,6 @@ def test_wrong_secret_rejected(client):
 
 
 def test_tampered_body_rejected(client):
-    from agentfiles_shared.auth import build_headers
-
     body = json.dumps({"path": "a"}).encode()
     headers = build_headers(
         token=TOKEN, secret=SECRET, method="POST", path="/v1/read", body=body
@@ -88,8 +104,6 @@ def test_tampered_body_rejected(client):
 
 
 def test_replay_rejected(client):
-    from agentfiles_shared.auth import build_headers
-
     body = json.dumps({"path": "x"}).encode()
     headers = build_headers(
         token=TOKEN, secret=SECRET, method="POST", path="/v1/read", body=body
@@ -105,7 +119,7 @@ def test_replay_rejected(client):
     assert second.json()["error"]["code"] == "replayed_nonce"
 
 
-def test_signed_call_reaches_handler(client, monkeypatch):
+def test_signed_call_reaches_handler(client):
     """A valid signed request passes auth and reaches the tool handler."""
     resp = signed_post(client, "/v1/read", {"path": "x"})
     assert resp.status_code == 200  # auth ok, handler raises not_implemented
@@ -161,30 +175,104 @@ def test_routes_do_not_depend_on_lifespan(tmp_path):
     assert resp.json()["error"]["code"] == "not_implemented"
 
 
-def test_httpx_client_round_trip(monkeypatch, tmp_path):
-    """ToolClient signs correctly and unwraps the server envelope."""
-    import httpx
-
-    from agentfiles_mcp.client import ToolClient
-    from agentfiles_mcp.config import Config as ClientConfig
-
+async def test_httpx_client_keeps_server_error_code(tmp_path):
+    """A 401 body carries a stable code (bad_signature, ...); the client must
+    not flatten it into a generic RemoteError."""
     app = create_app(ServerConfig(workspace=str(tmp_path), tokens={TOKEN: SECRET}))
+    tool_client = _asgi_client(app, secret="wrong-secret")
 
-    tool_client = ToolClient(
-        ClientConfig(url="http://testserver", token=TOKEN, secret=SECRET)
-    )
-    tool_client._http = httpx.AsyncClient(
+    with pytest.raises(ToolError) as exc:
+        await tool_client.call("read", {"path": "x"})
+    assert exc.value.code == "bad_signature"
+    await tool_client.aclose()
+
+
+async def test_handler_runs_off_the_event_loop(tmp_path, monkeypatch):
+    """Handlers are sync; if they ran inline in the async route, their thread
+    would be the event loop's own."""
+    seen: dict[str, int] = {}
+
+    def stub_execute(resolver, params):
+        seen["thread"] = threading.get_ident()
+        return ({"matches": []}, "")
+
+    monkeypatch.setattr(glob_tool, "execute", stub_execute)
+    app = create_app(ServerConfig(workspace=str(tmp_path), tokens={TOKEN: SECRET}))
+    loop_thread = threading.get_ident()
+
+    body = json.dumps({"pattern": "*"}, separators=(",", ":")).encode()
+    headers = build_headers(
+        token=TOKEN, secret=SECRET, method="POST", path="/v1/glob", body=body
+    ).as_dict()
+    headers["Content-Type"] = "application/json"
+
+    async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://testserver"
+    ) as client:
+        resp = await client.post("/v1/glob", content=body, headers=headers)
+        health = await client.get("/healthz")
+
+    assert resp.status_code == 200
+    assert health.json() == {"ok": True}
+    assert seen["thread"] != loop_thread
+
+
+async def test_httpx_client_round_trip(tmp_path):
+    """ToolClient signs correctly and unwraps the server envelope."""
+    app = create_app(ServerConfig(workspace=str(tmp_path), tokens={TOKEN: SECRET}))
+    tool_client = _asgi_client(app)
+
+    with pytest.raises(ToolError) as exc:
+        await tool_client.call("read", {"path": "x"})
+    assert exc.value.code == "not_implemented"
+    await tool_client.aclose()
+
+
+@respx.mock
+async def test_non_envelope_error_response_is_remote_error():
+    """A non-200 without the error envelope (e.g. proxy 502 HTML) is a transport
+    failure, not something to dress up as a tool error."""
+    respx.post("http://testserver/v1/read").mock(
+        return_value=httpx.Response(502, text="<html>bad gateway</html>")
     )
+    tool_client = _bare_client()
+    with pytest.raises(RemoteError):
+        await tool_client.call("read", {"path": "x"})
+    await tool_client.aclose()
 
-    from agentfiles_shared.errors import ToolError
 
-    async def run():
-        with pytest.raises(ToolError) as exc:
-            await tool_client.call("read", {"path": "x"})
-        assert exc.value.code == "not_implemented"
-        await tool_client.aclose()
+@respx.mock
+async def test_transport_failure_is_remote_error():
+    respx.post("http://testserver/v1/read").mock(
+        side_effect=httpx.ConnectError("connection refused")
+    )
+    tool_client = _bare_client()
+    with pytest.raises(RemoteError):
+        await tool_client.call("read", {"path": "x"})
+    await tool_client.aclose()
 
-    import asyncio
 
-    asyncio.run(run())
+@respx.mock
+async def test_malformed_error_envelope_uses_default_code():
+    """`error` that isn't an object must not blow up on `.get()`."""
+    respx.post("http://testserver/v1/read").mock(
+        return_value=httpx.Response(200, json={"ok": False, "error": "boom"})
+    )
+    tool_client = _bare_client()
+    with pytest.raises(ToolError) as exc:
+        await tool_client.call("read", {"path": "x"})
+    assert exc.value.code == "remote_error"
+    assert exc.value.message == "Remote tool failed"
+    await tool_client.aclose()
+
+
+@respx.mock
+async def test_non_object_body_is_remote_error():
+    """A 200 whose body isn't an envelope object must not crash on `.get()`."""
+    respx.post("http://testserver/v1/read").mock(
+        return_value=httpx.Response(200, json=[1, 2])
+    )
+    tool_client = _bare_client()
+    with pytest.raises(RemoteError):
+        await tool_client.call("read", {"path": "x"})
+    await tool_client.aclose()

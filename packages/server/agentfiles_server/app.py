@@ -8,6 +8,7 @@ from typing import TypeVar
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ValidationError
+from starlette.concurrency import run_in_threadpool
 
 from agentfiles_shared.errors import ToolError, invalid_input
 from agentfiles_shared.schema import (
@@ -58,7 +59,10 @@ def create_app(config: Config) -> FastAPI:
         async def route(request: Request) -> JSONResponse:
             try:
                 params = model.model_validate(parse_body(request))
-                structured, model_text = handler(resolver, params)
+                # Handlers are sync (file IO today, ripgrep subprocesses in
+                # step 5); run them off the event loop so they can't stall
+                # every other request.
+                structured, model_text = await run_in_threadpool(handler, resolver, params)
             except ToolError as exc:
                 return JSONResponse(
                     status_code=200,

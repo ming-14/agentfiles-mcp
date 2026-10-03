@@ -21,6 +21,28 @@ class RemoteError(Exception):
         self.detail = detail
 
 
+def _error_payload(response: httpx.Response) -> dict[str, Any] | None:
+    """The server's ``{"error": {"code", "message"}}`` body, when there is one."""
+    try:
+        data = response.json()
+    except ValueError:
+        return None
+    error = data.get("error") if isinstance(data, dict) else None
+    if isinstance(error, dict) and error.get("code"):
+        return error
+    return None
+
+
+def _tool_error(error: Any, fallback_message: str) -> ToolError:
+    """ToolError from an error envelope; tolerates a malformed envelope."""
+    if not isinstance(error, dict):
+        error = {}
+    return ToolError(
+        str(error.get("code", "remote_error")),
+        str(error.get("message") or fallback_message),
+    )
+
+
 class ToolClient:
     def __init__(self, config: Config) -> None:
         self._config = config
@@ -52,17 +74,20 @@ class ToolClient:
             raise RemoteError(f"request to {path} failed: {exc.__class__.__name__}") from exc
 
         if response.status_code != 200:
-            raise RemoteError(f"{path} returned HTTP {response.status_code}")
+            # 401 carries a stable code (unknown_token, bad_signature, ...);
+            # flattening it to "HTTP 401" would lose it downstream.
+            error = _error_payload(response)
+            if error is None:
+                raise RemoteError(f"{path} returned HTTP {response.status_code}")
+            raise _tool_error(error, f"{path} returned HTTP {response.status_code}")
 
         try:
             data = response.json()
         except json.JSONDecodeError as exc:
             raise RemoteError(f"{path} returned non-JSON body") from exc
+        if not isinstance(data, dict):
+            raise RemoteError(f"{path} returned an unexpected body")
 
         if not data.get("ok"):
-            error = data.get("error") or {}
-            raise ToolError(
-                str(error.get("code", "remote_error")),
-                str(error.get("message", "Remote tool failed")),
-            )
+            raise _tool_error(data.get("error"), "Remote tool failed")
         return data.get("result") or {}, data.get("modelText") or ""

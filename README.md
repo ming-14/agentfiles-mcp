@@ -37,6 +37,10 @@ Headers:
 不会进到 `hmac.compare_digest`。重放缓存的保留时长是 `2 × AF_MAX_SKEW`（默认 600s），
 覆盖整个 ±skew 窗口，避免客户端时钟超前时 nonce 先于时间戳窗口过期。
 
+认证失败按固定顺序报错：`missing_authorization` → `missing_signature_headers` →
+`unknown_token` → 时间戳 / nonce / 签名。签名头的存在性检查排在 token 查询之前，
+所以一个不带签名头的请求永远拿不到 `unknown_token`，无法据此枚举有效 token。
+
 ## 服务端
 
 环境变量：
@@ -79,6 +83,9 @@ POST /v1/grep    {pattern, path?, include?, limit?}
 { "ok": false, "error": { "code": "...", "message": "..." } }
 ```
 
+认证失败返回 `401`，响应体形状相同；`error.code` 是稳定值
+（`missing_authorization`、`unknown_token`、`bad_signature`…），客户端按它分流。
+
 ## 本地 MCP
 
 环境变量：
@@ -110,15 +117,29 @@ POST /v1/grep    {pattern, path?, include?, limit?}
 
 暴露的 MCP 工具：`read`、`write`、`edit`、`glob`、`grep`。
 
+工具参数的描述与取值约束直接取自 `agentfiles_shared.schema` 的输入模型，
+MCP 输入 schema 与 REST 请求体校验是同一份定义，改一处两边同步生效。
+工具失败呈现为 `Error executing tool <name>: [<code>] <message>`，方括号里的
+`code` 与 REST 响应的 `error.code` 相同（FastMCP 只保留异常文本，故写进文本）。
+
 ## 开发
 
 ```bash
-pip install -e packages/shared
-pip install --no-deps -e packages/server -e packages/mcp
-pip install pytest pytest-asyncio respx
-
-python -m pytest tests -q
+uv sync              # 安装三个 workspace 成员（editable）+ dev 依赖
+uv run pytest -q     # 全量单测（symlink 用例在部分平台自动跳过）
 ```
+
+没有 uv 也可以用 pip：
+
+```bash
+pip install -e packages/shared -e packages/server -e packages/mcp "mcp<2" \
+    pytest pytest-asyncio respx
+python -m pytest -q
+```
+
+依赖锁在 `uv.lock`（已提交）。默认索引是国内镜像，写在 `pyproject.toml` 的
+`[[tool.uv.index]]`；换官方源删掉那三行重新 `uv lock` 即可。
+`mcp` 钉在 `<2`：2.x 把 `mcp.server.fastmcp` 改名成了 `MCPServer`，迁移后可放开。
 
 ## 目录
 
@@ -130,12 +151,12 @@ packages/shared/agentfiles_shared/
   errors.py        模型可见错误文案（单一来源）
 packages/server/agentfiles_server/
   app.py           FastAPI 装配
-  middleware.py    认证链：token → 时间戳 → nonce → 签名
+  middleware.py    认证链：bearer → 签名头 → token → 时间戳 → nonce → 签名 → 重放
   config.py        环境变量配置
   fslayer.py       路径解析 / 逃逸校验
   tools/           read write edit glob grep
 packages/mcp/agentfiles_mcp/
-  server.py        FastMCP 工具定义
+  server.py        FastMCP 工具定义（参数 schema 取自 shared/schema.py）
   client.py        带签名的 HTTP 客户端
   config.py        环境变量配置
 tests/             单测 + 端到端

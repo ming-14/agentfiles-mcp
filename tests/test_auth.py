@@ -124,6 +124,18 @@ def test_missing_signature_headers():
     assert exc.value.code == "missing_signature_headers"
 
 
+def test_unsigned_request_cannot_probe_token_existence():
+    """Header presence is checked before the token lookup.
+
+    Otherwise a request without signature headers could tell unknown_token
+    from missing_signature_headers and enumerate valid tokens.
+    """
+    headers = build_headers(token="nope", secret=SECRET, method="POST", path="/v1/read", body=BODY)
+    with pytest.raises(AuthError) as exc:
+        do_verify(headers, nonce=None, signature=None)
+    assert exc.value.code == "missing_signature_headers"
+
+
 def test_nonce_replay_rejected():
     headers = build_headers(token=TOKEN, secret=SECRET, method="POST", path="/v1/read", body=BODY)
     cache = NonceCache()

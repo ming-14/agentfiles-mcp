@@ -9,11 +9,10 @@ Rules to keep identical to V2:
 from __future__ import annotations
 
 import os
-import posixpath
 from dataclasses import dataclass
 from pathlib import Path
 
-from agentfiles_shared.errors import ToolError, path_escape
+from agentfiles_shared.errors import path_escape
 
 REASON_RELATIVE_ESCAPE = "relative_escape"
 REASON_LOCATION_ESCAPE = "location_escape"
@@ -42,7 +41,7 @@ class Resolver:
     def __init__(self, root: str) -> None:
         self.root = os.path.realpath(root)
 
-    def resolve(self, path: str, *, kind: str = "file") -> Resolved:
+    def resolve(self, path: str) -> Resolved:
         """Resolve ``path`` against the workspace root.
 
         Raises ToolError('path_escape') on relative escape / symlink escape.
@@ -53,8 +52,6 @@ class Resolver:
             if not lexically_internal:
                 # external absolute path: allowed, but caller must authorize it
                 canonical = self._realpath_or_anchor(lexical)
-                directory = canonical if (kind == "directory" and os.path.isdir(canonical)) \
-                    else os.path.dirname(canonical)
                 return Resolved(
                     canonical=canonical,
                     resource=slash(canonical),
@@ -91,13 +88,3 @@ class Resolver:
         remainder = os.path.relpath(target, str(anchor))
         joined = os.path.normpath(os.path.join(resolved_anchor, remainder))
         return joined
-
-
-def relative_to(root: str, absolute: str) -> str:
-    return slash(posixpath.relpath(slash(absolute), slash(root)))
-
-
-def tool_error_unresolved(path: str, exc: Exception) -> ToolError:
-    if isinstance(exc, ToolError):
-        return exc
-    return path_escape(path, "unresolved")
