@@ -1,0 +1,23 @@
+[project]
+name = "agentfiles-mcp"
+version = "0.1.0"
+description = "Remote agent file tools: local MCP proxy + remote file server (V2 semantics)"
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.uv.workspace]
+members = ["packages/*"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "respx>=0.21",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.uv]
+package = false

@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# uv
+uv.lock
+
+# 测试 / 覆盖率
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# IDE / 系统
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# 本地配置与密钥（严禁提交）
+.env
+.env.*
+*.pem
+*.key
