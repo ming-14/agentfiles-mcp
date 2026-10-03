@@ -23,6 +23,23 @@ DEFAULT_IMAGE_MAX_HEIGHT = 2_000
 DEFAULT_IMAGE_MAX_BASE64_BYTES = 5 * 1024 * 1024
 
 
+# --- version marker (read/write/edit optimistic concurrency) ---------------
+
+class Version(BaseModel):
+    """File state marker returned by read/write/edit.
+
+    Compared with fstat(2) on an open handle, never via a path stat, so a
+    swapped file cannot pass verification. ``mtimeNs`` is integer nanoseconds
+    (float mtimes lose precision on Windows).
+    """
+
+    path: str = Field(description="Canonical absolute path on the server")
+    mtime_ns: int = Field(alias="mtimeNs", description="st_mtime_ns of the file")
+    size: int = Field(ge=0, description="Size in bytes")
+
+    model_config = {"populate_by_name": True}
+
+
 # --- read -----------------------------------------------------------------
 
 class ReadInput(BaseModel):
@@ -78,6 +95,13 @@ class WriteInput(BaseModel):
         "Location; external absolute paths require external_directory approval."
     )
     content: str = Field(description="Content to write to the file")
+    expected_version: Optional[Version] = Field(
+        default=None, alias="expectedVersion",
+        description="Version returned by the last read of this file. Required "
+        "when the file already exists; omit only to create a new file.",
+    )
+
+    model_config = {"populate_by_name": True}
 
 
 class WriteOutput(BaseModel):
@@ -85,6 +109,7 @@ class WriteOutput(BaseModel):
     target: str
     resource: str
     existed: bool
+    version: Version
 
 
 # --- edit -----------------------------------------------------------------
@@ -96,6 +121,10 @@ class EditInput(BaseModel):
     replace_all: Optional[bool] = Field(
         default=None, alias="replaceAll",
         description="Replace all exact occurrences of oldString (default false)",
+    )
+    expected_version: Optional[Version] = Field(
+        default=None, alias="expectedVersion",
+        description="Version returned by the last read of this file. Required.",
     )
 
     model_config = {"populate_by_name": True}
@@ -112,6 +141,7 @@ class FileDiffInfo(BaseModel):
 class EditOutput(BaseModel):
     files: list[FileDiffInfo]
     replacements: int
+    version: Version
 
 
 # --- glob / grep ----------------------------------------------------------

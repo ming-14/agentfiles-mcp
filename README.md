@@ -69,6 +69,27 @@ Image read successfully
 WEBP RIFF 长度），损坏 → `Image could not be decoded: <resource>`，此时不会产生下载。
 单文件传输上限 `AF_TRANSPORT_MAX`（默认 100MB）。
 
+### 写前必读（version 回执）
+
+write/edit 采用**严格模式**：写入必须发生在通过校验的那个文件句柄上，
+不经过路径二次打开——检查与写入之间被替换的文件不可能收到数据。
+
+```
+"version": { "path": "/abs/canonical", "mtimeNs": <st_mtime_ns>, "size": <bytes> }
+```
+
+- **read 文本成功**（含分页）→ 响应带 `version`，MCP 记入回执表
+- **write/edit 成功** → 返回**新** `version`，MCP 更新回执（连续修改无需重读）
+- 图片 / 目录 / 读失败 → 不带 `version`（没有凭据）
+- write/edit 请求由 MCP 自动附带 `expectedVersion`；服务端用 `fstat(句柄)` 比对
+  `mtimeNs + size`，edit 还会在读取后二次 fstat（抓住读到一半被改）
+- 无回执 → `version_missing`（`Read the file before editing it.`）
+- 不符 → `version_mismatch`（`File changed since it was last read. ...`）
+- 回执表在 MCP 进程内存（LRU 512），**不落盘**：重启即失效，fail-closed
+
+write 的特例：文件不存在且无回执 → 直接创建（`O_EXCL`，父目录自动建）；
+文件已存在且无回执 → 拒绝覆盖。
+
 ## 服务端
 
 环境变量：
@@ -81,7 +102,8 @@ WEBP RIFF 长度），损坏 → `Image could not be decoded: <resource>`，此�
 | `AF_TLS_CERT` / `AF_TLS_KEY` | | PEM 证书/私钥（启用内置 TLS） |
 | `AF_MAX_SKEW` | | 时间戳窗口秒数，默认 300 |
 | `AF_EXTERNAL_WHITELIST` | | JSON 数组，workspace 之外允许访问的目录，默认 `[]`（全拒） |
-| `AF_READ_DENY` | | JSON 数组，禁止读取的 wildcard，默认 `["*.env", "*.env.*"]` |
+| `AF_READ_DENY` | | JSON 数组，禁止**读取**的 wildcard，默认 `["*.env", "*.env.*"]` |
+| `AF_WRITE_DENY` | | JSON 数组，禁止**写入/编辑**的 wildcard，默认 `["*.env", "*.env.*"]`（与读黑名单独立） |
 | `AF_TRANSPORT_MAX` | | 单文件传输字节上限，默认 100MB |
 
 启动：
@@ -196,22 +218,24 @@ python -m pytest -q
 
 ```
 packages/shared/agentfiles_shared/
-  schema.py        工具输入/输出模型
+  schema.py        工具输入/输出模型（含 Version 版本标记）
   auth.py          HMAC 签名构造与校验（canonical 含 query）
   nonce_cache.py   重放保护（内存 TTL 缓存）
-  wildcard.py      V2 语义的通配符匹配（AF_READ_DENY 复用）
+  wildcard.py      V2 语义的通配符匹配（黑白名单复用）
   transport.py     下载描述符与传输常量
   errors.py        模型可见错误文案（单一来源）
 packages/server/agentfiles_server/
   app.py           FastAPI 装配 + transport 路由
   middleware.py    认证链：bearer → 签名头 → token → 时间戳 → nonce → 签名 → 重放
-  config.py        环境变量配置（含白名单/黑名单/传输上限）
+  config.py        环境变量配置（白名单 / 读黑名单 / 写黑名单 / 传输上限）
   fslayer.py       路径解析 / 逃逸校验 / 外部白名单
+  filemut.py       严格模式句柄读写 + version 校验 + 目标锁 + BOM
   readfs.py        read 引擎：嗅探、分页、目录列表、图片结构校验
   transport.py     签名下载端点（containment + read-deny + 大小校验）
   tools/           read write edit glob grep
 packages/mcp/agentfiles_mcp/
-  server.py        FastMCP 工具定义（参数 schema 取自 shared/schema.py）
+  server.py        FastMCP 工具定义 + 回执记账
+  receipts.py      version 回执表（LRU，进程内存）
   client.py        带签名的 HTTP 客户端（POST + 下载）
   transport.py     下载落盘（temp 目录、.part 原子改名）
   config.py        环境变量配置

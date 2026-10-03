@@ -10,6 +10,8 @@ AF_EXTERNAL_WHITELIST   JSON array of directories allowed outside the workspace
                         (default []: everything outside the workspace is rejected)
 AF_READ_DENY            JSON array of wildcard patterns that may never be read
                         (default ["*.env", "*.env.*"])
+AF_WRITE_DENY           JSON array of wildcard patterns that may never be
+                        written/edited (default ["*.env", "*.env.*"])
 AF_TRANSPORT_MAX        max bytes for a single file transport, default 100MB
 """
 
@@ -52,6 +54,7 @@ class Config:
     max_skew: int = DEFAULT_MAX_SKEW
     external_whitelist: list[str] = field(default_factory=list)
     read_deny: list[str] = field(default_factory=lambda: list(DEFAULT_READ_DENY))
+    write_deny: list[str] = field(default_factory=lambda: list(DEFAULT_READ_DENY))
     transport_max: int = DEFAULT_TRANSPORT_MAX_BYTES
 
     @property
@@ -88,6 +91,7 @@ def load() -> Config:
             os.path.abspath(p) for p in _json_list("AF_EXTERNAL_WHITELIST", [])
         ],
         read_deny=_json_list("AF_READ_DENY", DEFAULT_READ_DENY),
+        write_deny=_json_list("AF_WRITE_DENY", DEFAULT_READ_DENY),
         transport_max=int(
             os.environ.get("AF_TRANSPORT_MAX", str(DEFAULT_TRANSPORT_MAX_BYTES))
         ),

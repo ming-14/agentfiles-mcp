@@ -14,6 +14,7 @@ from agentfiles_shared.schema import ReadInput
 from agentfiles_shared.transport import DownloadDescriptor
 from agentfiles_shared.wildcard import match as wildcard_match
 
+from .. import filemut
 from .. import readfs
 from ..config import Config
 from ..fslayer import Resolver
@@ -72,6 +73,9 @@ def _run(
         result = content.model_dump()
     else:
         result = content.to_result()
+        # text reads grant the write/edit receipt (images and directories do not)
+        version = filemut.version_of_path(target.canonical)
+        result["version"] = version.model_dump(by_alias=True)
     return result, _model_text(result)
 
 

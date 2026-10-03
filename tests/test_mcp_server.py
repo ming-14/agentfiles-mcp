@@ -41,15 +41,26 @@ class RecordingClient:
         pass
 
 
+# Internal-only wire fields: the MCP layer manages these itself (version
+# receipts are attached/recorded by the proxy, invisible to the model).
+INTERNAL_FIELDS = {"expectedVersion"}
+
+
 async def test_tool_schemas_are_single_sourced():
     """Every MCP input schema must equal the shared schema model's schema —
-    the FieldInfo is borrowed, so drift is structurally impossible."""
+    the FieldInfo is borrowed, so drift is structurally impossible.
+    Internal-only fields (version receipts) are hidden from the model."""
     tools = {tool.name: tool for tool in await server.mcp.list_tools()}
     assert set(tools) == set(MODELS)
     for name, model in MODELS.items():
         want = model.model_json_schema()
         got = tools[name].inputSchema
-        assert got["properties"] == want["properties"], name
+        want_props = {
+            key: value
+            for key, value in want["properties"].items()
+            if key not in INTERNAL_FIELDS
+        }
+        assert got["properties"] == want_props, name
         assert set(got["required"]) == set(want.get("required", [])), name
 
 

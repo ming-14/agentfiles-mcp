@@ -109,6 +109,30 @@ def unable_to_edit(path: str) -> ToolError:
     return ToolError("unable_to_edit", f"Unable to edit {path}")
 
 
+# --- version (optimistic concurrency) --------------------------------------
+
+def version_missing_edit() -> ToolError:
+    return ToolError("version_missing", "Read the file before editing it.")
+
+
+def version_missing_write() -> ToolError:
+    return ToolError("version_missing", "Read the file before overwriting it.")
+
+
+def version_mismatch_edit() -> ToolError:
+    return ToolError(
+        "version_mismatch",
+        "File changed since it was last read. Read it again before editing.",
+    )
+
+
+def version_mismatch_write() -> ToolError:
+    return ToolError(
+        "version_mismatch",
+        "File changed since it was last read. Read it again before writing.",
+    )
+
+
 # --- glob / grep ----------------------------------------------------------
 
 def unable_to_find_files(pattern: str) -> ToolError:

@@ -27,9 +27,11 @@ from agentfiles_shared.transport import DownloadDescriptor
 
 from .client import RemoteError, ToolClient
 from .config import load as load_config
+from .receipts import ReceiptBook, record_result
 from . import transport as file_transport
 
 _client: ToolClient | None = None
+_receipts = ReceiptBook()
 
 
 @asynccontextmanager
@@ -68,15 +70,28 @@ def _render(result: dict, model_text: str) -> str:
 
 
 async def _call(tool: str, payload: dict[str, Any]) -> str:
+    # write/edit carry the last observed version; the server verifies it
+    # against fstat and answers version_missing when we have never read the file
+    if tool in ("write", "edit"):
+        receipt = _receipts.lookup(str(payload.get("path", "")))
+        if receipt is not None:
+            payload = {**payload, "expectedVersion": receipt}
     try:
         result, model_text = await client().call(tool, payload)
     except RemoteError as exc:
         # surfaced to the model as a tool error rather than crashing the session
         raise ToolError("remote_unavailable", str(exc.detail)) from exc
     except ToolError as exc:
+        # a stale or missing receipt is the model's signal to read again;
+        # drop it so the next attempt re-verifies from scratch
+        if exc.code in ("version_missing", "version_mismatch"):
+            _receipts.forget(str(payload.get("path", "")))
         # FastMCP flattens any exception into `Error executing tool <name>:
         # <str(e)>`, which would drop ``exc.code``; carry it in the text.
         raise ToolError(exc.code, f"[{exc.code}] {exc.message}") from exc
+    # receipts are keyed by the path the model used: the returned version.path
+    # is a server-absolute path the MCP layer cannot re-derive for relative input
+    record_result(_receipts, str(payload.get("path", "")), result)
     if result.get("type") == "download":
         return await _materialize(result, model_text)
     return _render(result, model_text)
