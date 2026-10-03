@@ -38,8 +38,9 @@ class Version(BaseModel):
     ``ino``/``dev`` catch a replacement that kept both size and mtime -- on
     exFAT and most network volumes mtime has second granularity, so a
     same-length rewrite inside the same second is invisible to mtime+size.
-    They default to 0 (== "not supplied"), which skips the comparison, so a
-    marker minted by an older client still verifies exactly as before.
+    They are compared whenever the volume reports an identity; a marker that
+    omits them (default 0) is a mismatch rather than a weaker check, and only
+    a file whose own ``st_ino`` is 0 falls back to mtime+size alone.
     """
 
     path: str = Field(description="Canonical absolute path on the server")

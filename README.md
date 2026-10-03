@@ -89,11 +89,16 @@ write/edit 采用**严格模式**：写入必须发生在通过校验的那个�
   MCP 更新回执（连续修改无需重读）
 - 图片 / 目录 / 读失败 → 不带 `version`（没有凭据）
 - write/edit 请求由 MCP 自动附带 `expectedVersion`；服务端用 `fstat(句柄)` 比对
-  `mtimeNs + size`，标记带 `ino/dev` 时再比对文件身份（同尺寸、同 mtime 的替换
-  也躲不掉）；edit 还会用**读取之前**取的基线 fstat 在解码后再校验一次
-  （抓住读到一半被改）
-- edit 超过 `MAX_EDIT_BYTES`（2MiB）→ `edit_too_large`；返回的 `patch` 逐行截断
-  到 2000 字符、总量超过 50KB 就截断并附省略说明
+  `mtimeNs + size`，并在卷提供文件身份时比对 `ino/dev`（同尺寸、同 mtime 的替换
+  也躲不掉）。身份由**卷**决定、不由请求方决定：标记省略 `ino/dev` 一律算不符，
+  否则校验强度可以被调用方下调
+- 同一路径的 write/edit 由进程内目标锁串行：并发写入要么排队，要么拿到
+  `version_mismatch`，不会两边都成功而其中一个被静默覆盖
+- edit 还会用**读取之前**取的基线 fstat 在解码后再校验一次（抓住读到一半被改）
+- edit 的大小上限在**已校验的句柄**上判定（CAS 之后、读入内存之前，不再按路径
+  二次 stat）：超过 `MAX_EDIT_BYTES`（2MiB）→ `edit_too_large`；文件与回执不符
+  则先报 `version_mismatch`（更可操作）。返回的 `patch` 逐行截断到 2000 字符、
+  总量超过 50KB 就截断并附省略说明
 - 权限 / 目录 / 磁盘满等文件系统错误 → `unable_to_read` / `unable_to_write` /
   `unable_to_edit`，不会漏成 `internal`
 - 无回执 → `version_missing`（`Read the file before editing it.`）

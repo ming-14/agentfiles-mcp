@@ -82,6 +82,43 @@ def test_finish_marks_from_the_handle_not_the_path(tmp_path, monkeypatch):
         assert saved.read() == b"written\n"
 
 
+# --- _matches: what a marker has to agree with -------------------------------
+
+def _stat(mtime_ns: int, size: int, ino: int, dev: int):
+    import types
+
+    return types.SimpleNamespace(
+        st_mtime_ns=mtime_ns, st_size=size, st_ino=ino, st_dev=dev
+    )
+
+
+def test_matches_identity_when_the_volume_has_one():
+    from agentfiles_server import filemut
+
+    stat = _stat(111, 8, 42, 7)
+    assert filemut._matches(stat, 111, 8, 42, 7) is True
+    # same size, same mtime, different file
+    assert filemut._matches(stat, 111, 8, 43, 7) is False
+
+
+def test_matches_treats_an_omitted_identity_as_a_mismatch():
+    """The comparison is chosen by what the volume reports, not by what the
+    caller bothered to carry -- otherwise ino/dev could be dropped to get the
+    weaker mtime+size check."""
+    from agentfiles_server import filemut
+
+    assert filemut._matches(_stat(111, 8, 42, 7), 111, 8, 0, 0) is False
+
+
+def test_matches_falls_back_to_mtime_and_size_without_inodes():
+    """A file with no st_ino of its own has no identity to compare."""
+    from agentfiles_server import filemut
+
+    stat = _stat(111, 8, 0, 0)
+    assert filemut._matches(stat, 111, 8, 0, 0) is True
+    assert filemut._matches(stat, 111, 9, 0, 0) is False
+
+
 # --- target_lock: the table must not grow forever ----------------------------
 
 def _key(path: str) -> str:
@@ -96,6 +133,57 @@ def test_target_lock_entry_is_released_when_idle():
     with filemut.target_lock(key):
         assert _key(key) in filemut._locks
     assert _key(key) not in filemut._locks
+
+
+def test_target_lock_yields_a_held_lock():
+    """The manager hands out a Lock object -- it has to acquire it too. A
+    context manager that merely yields the object makes every
+    ``with target_lock(path)`` a critical section in appearance only."""
+    from agentfiles_server import filemut
+
+    key = "lock-acquired-test.txt"
+    with filemut.target_lock(key) as lock:
+        assert lock.locked()
+
+
+def test_target_lock_excludes_a_second_caller():
+    """Concurrency: two callers on one path must not be inside at once.
+
+    Without mutual exclusion two edits both pass verify_unchanged (neither
+    has written yet) and both report success -- one payload is silently lost.
+    """
+    import threading
+
+    from agentfiles_server import filemut
+
+    key = "lock-exclusive-test.txt"
+    entered = threading.Event()
+    release = threading.Event()
+    second = {}
+
+    def holder():
+        with filemut.target_lock(key):
+            entered.set()
+            release.wait(5)
+
+    def waiter():
+        with filemut.target_lock(key):
+            second["inside"] = True
+
+    first = threading.Thread(target=holder)
+    first.start()
+    try:
+        assert entered.wait(5)
+        late = threading.Thread(target=waiter)
+        late.start()
+        late.join(0.5)
+        assert "inside" not in second, "second caller entered a held section"
+        release.set()
+        late.join(5)
+        assert second.get("inside") is True, "the waiter never got in"
+    finally:
+        release.set()
+        first.join(5)
 
 
 def test_target_lock_entry_lives_while_a_caller_holds_it():

@@ -9,7 +9,6 @@ Pure exact matching (V2 has no fuzzy chain either). Order:
 from __future__ import annotations
 
 import difflib
-import os
 
 from agentfiles_shared.errors import (
     ToolError,
@@ -78,26 +77,23 @@ def _run(resolver: Resolver, config: Config, params: EditInput) -> tuple[dict, s
     if any(wildcard_match(p, target.resource) for p in config.write_deny):
         raise ToolError("write_deny", f"Unable to edit {params.path}")
 
-    if params.expected_version is None:
+    expected = params.expected_version
+    if expected is None:
         raise filemut.version_missing_edit()
 
     with filemut.target_lock(target.canonical):
-        # The limit has to be checked before the read: open_verified pulls the
-        # whole file into memory. A file that grows past the marker between
-        # here and the open fails _verify instead, so nothing slips through.
-        try:
-            size = os.path.getsize(target.canonical)
-        except OSError:
-            size = 0  # absent/unstatable: open_verified reports the real error
-        if size > MAX_EDIT_BYTES:
-            raise edit_too_large(params.path, size, MAX_EDIT_BYTES)
-
         handle = filemut.open_verified(
             target.canonical,
-            params.expected_version,
+            expected,
             on_missing=filemut.version_missing_edit(),
             on_mismatch=filemut.version_mismatch_edit(),
             create=False,
+            # budget enforced on the verified handle: after the CAS (a file
+            # that no longer matches the marker is version_mismatch, the more
+            # actionable answer) and before the read that fills memory
+            max_bytes=MAX_EDIT_BYTES,
+            on_too_large=edit_too_large(params.path, expected.size,
+                                        MAX_EDIT_BYTES),
         )
         if handle is None:
             # open_verified(create=False) never returns None; an explicit error

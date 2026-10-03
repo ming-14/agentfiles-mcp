@@ -43,6 +43,10 @@ def target_lock(canonical: str) -> Iterator[threading.Lock]:
     Entries are reference-counted rather than evicted on release: a long-lived
     server must not keep one lock per path it has ever mutated, but the object
     has to outlive anyone still waiting on it.
+
+    The lock is *acquired* here, not merely handed out: callers write
+    ``with target_lock(path):``, and a context manager that only yielded the
+    Lock would be a critical section in appearance only.
     """
     key = canonical.replace("\\", "/").lower() if os.name == "nt" else canonical
     with _locks_guard:
@@ -51,7 +55,9 @@ def target_lock(canonical: str) -> Iterator[threading.Lock]:
             lock = _locks[key] = threading.Lock()
         _locks_in_use[key] = _locks_in_use.get(key, 0) + 1
     try:
-        yield lock
+        # outside _locks_guard: blocking here must not stall other paths
+        with lock:
+            yield lock
     finally:
         with _locks_guard:
             remaining = _locks_in_use.get(key, 0) - 1
@@ -133,15 +139,21 @@ def _matches(stat: os.stat_result, mtime_ns: int, size: int, ino: int,
              dev: int) -> bool:
     """Do ``stat`` and a marker carrying these fields describe one state?
 
-    mtime + size always; the file identity only when the marker has one --
-    ``ino == 0`` means "no identity" (a marker minted without it, or a
-    filesystem without inodes) and keeps the mtime+size-only comparison.
-    Identity is what catches a same-length rewrite stamped with the old
-    mtime (exFAT and most network volumes store seconds).
+    mtime + size always. The file identity (st_ino/st_dev) is compared
+    whenever the volume reports one -- that is what catches a same-length
+    rewrite stamped with the old mtime (exFAT and most network volumes store
+    seconds).
+
+    Omitting it is a mismatch, not a downgrade: the check must not get weaker
+    because a caller stopped carrying ino/dev, and the server always mints
+    them when the filesystem has them. Only a file with no identity of its
+    own (``st_ino == 0``) falls back to mtime + size alone.
     """
     if stat.st_mtime_ns != mtime_ns or stat.st_size != size:
         return False
-    return not (ino and (stat.st_ino != ino or stat.st_dev != dev))
+    if not stat.st_ino:
+        return True  # filesystem without inodes: mtime + size is all there is
+    return ino == stat.st_ino and dev == stat.st_dev
 
 
 def _verify(stat: os.stat_result, expected: Version, canonical: str, on_mismatch) -> None:
@@ -166,11 +178,18 @@ def open_verified(
     on_missing,
     on_mismatch,
     create: bool,
+    max_bytes: int | None = None,
+    on_too_large=None,
 ) -> VersionedFile | None:
     """Open and verify ``canonical``; return None when the caller may create it.
 
     create=True (write tool only): an absent file with no expected version
     yields None so the caller can do an O_EXCL create.
+
+    ``max_bytes`` bounds what is pulled into memory (``on_too_large`` is
+    required with it). It is checked on the verified handle -- after the CAS,
+    so a stale marker still answers ``on_mismatch``, and before the read, so
+    an oversized file is never slurped.
     """
     try:
         fd = os.open(canonical, os.O_RDWR | _O_BINARY)
@@ -192,6 +211,8 @@ def open_verified(
         # landing inside the read becomes the baseline itself.
         stat = os.fstat(fd)
         _verify(stat, expected, canonical, on_mismatch)
+        if max_bytes is not None and stat.st_size > max_bytes:
+            raise on_too_large
         content = _read_all(fd)
         had_bom, _ = split_bom(content)
         return VersionedFile(fd=fd, canonical=canonical, content=content,

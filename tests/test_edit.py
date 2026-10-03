@@ -211,17 +211,21 @@ def test_same_size_same_mtime_swap_is_caught(workspace):
     assert target.read_bytes() == b"another\n"
 
 
-def test_marker_without_identity_still_verifies(workspace):
-    """ino/dev default to 0 == "not supplied": a marker minted without them
-    keeps the previous mtime+size comparison instead of failing every call."""
+def test_marker_without_identity_is_rejected(workspace):
+    """Omitting ino/dev must not weaken the check: the comparison is chosen
+    by what the volume reports, not by what the caller bothered to send."""
     (workspace / "a.txt").write_bytes(b"content\n")
     with make_client(workspace) as client:
         version = read_version(client, "a.txt")
-        legacy = {key: value for key, value in version.items()
-                  if key not in ("ino", "dev")}
-        data = edit(client, "a.txt", "content", "other", legacy)
-    assert data["ok"] is True, data
-    assert (workspace / "a.txt").read_bytes() == b"other\n"
+        assert version["ino"] != 0, "filesystem reports no inode; test is inert"
+        stripped = {key: value for key, value in version.items()
+                    if key not in ("ino", "dev")}
+        data = edit(client, "a.txt", "content", "other", stripped)
+    assert data["ok"] is False
+    assert data["error"]["code"] == "version_mismatch"
+    assert (workspace / "a.txt").read_bytes() == b"content\n"
+
+
 
 
 def test_mid_read_change_detected(workspace, monkeypatch):
@@ -359,6 +363,22 @@ def test_file_over_the_edit_limit_is_rejected(workspace, monkeypatch):
         "File is 4097 bytes, exceeding the 1024 byte edit limit: big.txt"
     )
     assert (workspace / "big.txt").read_bytes() == b"x" * 4096 + b"\n"
+
+
+def test_file_that_grew_past_the_marker_reports_mismatch(workspace, monkeypatch):
+    """The size verdict comes from the marker, not from a second stat of the
+    path: a file that grew since the read is a stale marker (mismatch), not
+    "too large to edit"."""
+    from agentfiles_server.tools import edit as edit_tool
+
+    monkeypatch.setattr(edit_tool, "MAX_EDIT_BYTES", 1024)
+    (workspace / "a.txt").write_bytes(b"content\n")
+    with make_client(workspace) as client:
+        version = read_version(client, "a.txt")
+        (workspace / "a.txt").write_bytes(b"x" * 4096 + b"\n")
+        data = edit(client, "a.txt", "content", "other", version)
+    assert data["error"]["code"] == "version_mismatch"
+    assert (workspace / "a.txt").read_bytes() == b"x" * 4096 + b"\n"
 
 
 def test_patch_clips_long_lines_and_stops_at_the_budget(workspace, monkeypatch):

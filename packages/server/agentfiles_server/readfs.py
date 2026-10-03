@@ -232,7 +232,11 @@ def read_file(
         raise path_kind(resource, "a file")
 
     with open(real, "rb") as handle:
-        # one fstat, before any read: receipt source and authoritative size
+        # one fstat, before any read: receipt source and authoritative size.
+        # The size is deliberately the handle's, not a fresh os.path.getsize:
+        # a file that grows after this point is under-read (a shorter sniff
+        # sample, a shorter page) rather than described by a size that never
+        # matched the bytes we are about to return.
         marker = version_of(handle.fileno(), absolute)
         size = marker.size
         first = handle.read(min(64 * 1024, size or 4 * 1024))
