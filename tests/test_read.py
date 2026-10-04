@@ -38,12 +38,16 @@ def workspace(tmp_path):
 def client(workspace):
     config = Config(workspace=str(workspace), tokens={TOKEN: SECRET})
     with TestClient(create_app(config)) as test_client:
+        # helpers attach this as the request cwd (set cwd=None explicitly to
+        # exercise the cwd_not_set rejection)
+        test_client.af_workspace = str(workspace)
         yield test_client
 
 
 def read(client, path, **kwargs):
     payload = {"path": path}
     payload.update(kwargs)
+    payload.setdefault("cwd", getattr(client, "af_workspace", None))
     return signed_post(client, "/v1/read", payload)
 
 
@@ -247,23 +251,27 @@ def test_external_path_rejected_by_default(client, tmp_path):
     outside.write_text("hi")
     data = read(client, str(outside)).json()
     assert data["ok"] is False
-    assert data["error"]["code"] == "path_escape"
+    # unified surface: a path outside containment reads exactly like a missing
+    # one (the reason is logged server-side only)
+    assert data["error"]["code"] == "unable_to_read"
+    assert data["error"]["message"] == f"Unable to read {outside}"
 
 
 def test_relative_escape_rejected(client, workspace, tmp_path):
     outside = tmp_path / "outside.txt"
     outside.write_text("hi")
     data = read(client, "../outside.txt").json()
-    assert data["error"]["code"] == "path_escape"
+    assert data["error"]["code"] == "unable_to_read"
+    assert data["error"]["message"] == "Unable to read ../outside.txt"
 
 
 def test_file_as_directory_reports_input_not_server_path(client, workspace):
     """Errors echo what the caller sent; the workspace path stays server-side."""
     make_text_file(workspace, "sub.txt", "x")
     data = read(client, "sub.txt/inner").json()
-    assert data["error"]["code"] == "path_escape"
-    assert "non_directory_ancestor" in data["error"]["message"]
-    assert "sub.txt/inner" in data["error"]["message"]
+    assert data["ok"] is False
+    # sub.txt is a file: the kernel refuses to traverse it -> generic message
+    assert data["error"]["message"] == "Unable to read sub.txt/inner"
     assert str(workspace) not in data["error"]["message"]
 
 
@@ -286,14 +294,14 @@ def test_whitelisted_external_path_allowed(tmp_path):
 
 def test_cross_drive_path_is_path_escape_not_internal(client, workspace):
     """os.path.relpath raises across drives on Windows; the tool must report
-    path_escape instead of leaking an `internal` error."""
+    a generic read failure instead of leaking an `internal` error."""
     if os.name != "nt":
         pytest.skip("cross-drive paths only exist on Windows")
     home_drive = os.path.splitdrive(str(workspace))[0].upper()
     other = "D:" if home_drive != "D:" else "E:"
     data = read(client, f"{other}/data/x.txt").json()
     assert data["ok"] is False
-    assert data["error"]["code"] == "path_escape"
+    assert data["error"]["code"] == "unable_to_read"
 
 
 def test_cross_drive_link_filtered_from_listing(client, workspace, monkeypatch):
@@ -408,7 +416,10 @@ def test_download_outside_workspace_rejected(client, tmp_path):
     resp = signed_get(
         client, "/v1/transport/download", f"path={quote(str(outside), safe='')}"
     )
-    assert resp.status_code == 403
+    # same envelope as a missing file: the channel cannot be used to map
+    # what exists outside the workspace (reason logged server-side only)
+    assert resp.status_code == 404
+    assert resp.json()["error"]["code"] == "transport_unavailable"
 
 
 def test_download_read_deny_enforced(client, workspace):
@@ -459,7 +470,7 @@ def test_download_whitelisted_external_allowed(tmp_path):
 
 
 def test_download_cross_drive_is_rejected_not_500(client, workspace):
-    """containment across drives must fail as 403; contains() used to raise
+    """containment across drives must fail cleanly; contains() used to raise
     ValueError here, which escaped the handler as a 500."""
     if os.name != "nt":
         pytest.skip("cross-drive paths only exist on Windows")
@@ -470,8 +481,8 @@ def test_download_cross_drive_is_rejected_not_500(client, workspace):
     resp = signed_get(
         client, "/v1/transport/download", f"path={quote(other + '/data/x.txt', safe='')}"
     )
-    assert resp.status_code == 403
-    assert resp.json()["error"]["code"] == "path_escape"
+    assert resp.status_code == 404
+    assert resp.json()["error"]["code"] == "transport_unavailable"
 
 
 def test_corrupt_png_rejected(client, workspace):
@@ -507,22 +518,23 @@ def test_receipt_comes_from_the_read_handle(client, workspace, monkeypatch):
     import agentfiles_server.readfs as readfs
 
     (workspace / "a.txt").write_bytes(b"original\n")
-    real_read_file = readfs.read_file
+    real_read_opened = readfs.read_opened
 
     def swapping(*args, **kwargs):
-        payload = real_read_file(*args, **kwargs)
+        payload = real_read_opened(*args, **kwargs)
         # external writer replaces the file at the same path right after our
         # read returns -- the window a path stat taken afterwards would cover
         (workspace / "a.txt").write_bytes(b"SECRET THE MODEL NEVER SAW\n")
         return payload
 
-    monkeypatch.setattr(readfs, "read_file", swapping)
+    monkeypatch.setattr(readfs, "read_opened", swapping)
     version = read(client, "a.txt").json()["result"]["version"]
 
     data = signed_post(client, "/v1/write", {
         "path": "a.txt",
         "content": "OVERWRITTEN\n",
         "expectedVersion": version,
+        "cwd": str(workspace),
     }).json()
     assert data["ok"] is False
     assert data["error"]["code"] == "version_mismatch"
@@ -595,6 +607,7 @@ def test_receipt_matches_content_under_a_concurrent_writer(client, workspace):
                 "path": "racy.txt",
                 "content": "D" * size,
                 "expectedVersion": receipt,
+                "cwd": str(workspace),
             }).json()
             # clean tool errors only -- never an internal one
             assert outcome["ok"] or outcome["error"]["code"] != "internal", outcome
@@ -631,7 +644,7 @@ def test_filesystem_failure_reports_unable_to_read(client, workspace, monkeypatc
     def boom(*args, **kwargs):
         raise PermissionError(13, "Permission denied")
 
-    monkeypatch.setattr(readfs, "read_file", boom)
+    monkeypatch.setattr(readfs, "read_opened", boom)
     data = read(client, "a.txt").json()
     assert data["ok"] is False
     assert data["error"] == {

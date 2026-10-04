@@ -40,11 +40,20 @@ def make_client(workspace, **overrides) -> TestClient:
         read_deny=overrides.get("read_deny", []),
         write_deny=overrides.get("write_deny", []),
     )
-    return TestClient(create_app(config))
+    client = TestClient(create_app(config))
+    client.af_workspace = str(workspace)
+    return client
+
+
+def _with_cwd(client, payload: dict) -> dict:
+    payload.setdefault("cwd", getattr(client, "af_workspace", None))
+    return payload
 
 
 def read_version(client, path: str) -> dict:
-    data = signed_post(client, "/v1/read", {"path": path}).json()
+    data = signed_post(
+        client, "/v1/read", _with_cwd(client, {"path": path})
+    ).json()
     assert data["ok"], data
     return data["result"]["version"]
 
@@ -55,7 +64,7 @@ def edit(client, path, old, new, version=None, replace_all=None):
         payload["expectedVersion"] = version
     if replace_all is not None:
         payload["replaceAll"] = replace_all
-    return signed_post(client, "/v1/edit", payload).json()
+    return signed_post(client, "/v1/edit", _with_cwd(client, payload)).json()
 
 
 EXPECTED_MODEL_TEXT = (
@@ -264,6 +273,7 @@ def test_deny_hides_match_information(workspace):
         read_deny=[], write_deny=["*.env"],
     )
     with TestClient(create_app(config)) as client:
+        client.af_workspace = str(workspace)
         version = read_version(client, ".env")
         hit = edit(client, ".env", "SECRET=1", "x", version)
         miss = edit(client, ".env", "ABSENT", "y", version)

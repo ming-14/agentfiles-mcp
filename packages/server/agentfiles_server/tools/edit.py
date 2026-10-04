@@ -26,22 +26,23 @@ from agentfiles_shared.schema import (
     MAX_READ_BYTES,
     EditInput,
 )
-from agentfiles_shared.wildcard import match as wildcard_match
 
 from .. import filemut
 from ..config import Config
 from ..fslayer import Resolver
+from ..handlepath import OPEN_RDWR
 
 _TRANSPARENT_CODES = {
     "version_missing",
     "version_mismatch",
-    "path_escape",
     "write_deny",
     "edit_identical",
     "edit_empty_old",
     "edit_not_found",
     "edit_multiple_matches",
     "edit_too_large",
+    "cwd_not_set",
+    "invalid_input",
 }
 
 PREVIEW_LINES = 6
@@ -73,67 +74,74 @@ def execute(
 
 
 def _run(resolver: Resolver, config: Config, params: EditInput) -> tuple[dict, str]:
-    target = resolver.resolve(params.path)
-    if any(wildcard_match(p, target.resource) for p in config.write_deny):
-        raise ToolError("write_deny", f"Unable to edit {params.path}")
-
+    full = resolver.locate(params.path, params.cwd)
     expected = params.expected_version
     if expected is None:
         raise filemut.version_missing_edit()
 
-    with filemut.target_lock(target.canonical):
-        handle = filemut.open_verified(
-            target.canonical,
-            expected,
-            on_missing=filemut.version_missing_edit(),
-            on_mismatch=filemut.version_mismatch_edit(),
-            create=False,
+    with filemut.target_lock(full):
+        try:
+            opened = resolver.open_checked(
+                full,
+                flags=OPEN_RDWR,
+                expect="file",
+                deny=config.write_deny,
+                on_deny=ToolError("write_deny", f"Unable to edit {params.path}"),
+            )
+        except FileNotFoundError:
+            # the receipt said it existed; it is gone -> same actionable
+            # message as a marker mismatch (V2 maps this to on_mismatch)
+            raise filemut.version_mismatch_edit() from None
+        except IsADirectoryError:
+            raise unable_to_edit(params.path) from None
+        with opened:
             # budget enforced on the verified handle: after the CAS (a file
             # that no longer matches the marker is version_mismatch, the more
             # actionable answer) and before the read that fills memory
-            max_bytes=MAX_EDIT_BYTES,
-            on_too_large=edit_too_large(params.path, expected.size,
-                                        MAX_EDIT_BYTES),
-        )
-        if handle is None:
-            # open_verified(create=False) never returns None; an explicit error
-            # rather than an assert, which `python -O` would strip
-            raise filemut.version_missing_edit()
-        try:
-            text = _decode(handle.content, params.path)
-            # any change landing since the pre-read fstat (mid-read or while
-            # we were decoding) invalidates the match set
-            filemut.verify_unchanged(handle, filemut.version_mismatch_edit())
+            handle = filemut.verify_opened(
+                opened,
+                expected,
+                on_missing=filemut.version_mismatch_edit(),
+                on_mismatch=filemut.version_mismatch_edit(),
+                max_bytes=MAX_EDIT_BYTES,
+                on_too_large=edit_too_large(params.path, expected.size,
+                                            MAX_EDIT_BYTES),
+            )
+            try:
+                text = _decode(handle.content, params.path)
+                # any change landing since the pre-read fstat (mid-read or while
+                # we were decoding) invalidates the match set
+                filemut.verify_unchanged(handle, filemut.version_mismatch_edit())
 
-            ending = "\r\n" if "\r\n" in text else "\n"
-            old = _to_ending(params.old_string, ending)
-            new = _to_ending(params.new_string, ending)
+                ending = "\r\n" if "\r\n" in text else "\n"
+                old = _to_ending(params.old_string, ending)
+                new = _to_ending(params.new_string, ending)
 
-            count = _count(text, old)
-            if count == 0:
-                raise edit_not_found()
-            if count > 1 and not params.replace_all:
-                raise edit_multiple_matches()
+                count = _count(text, old)
+                if count == 0:
+                    raise edit_not_found()
+                if count > 1 and not params.replace_all:
+                    raise edit_multiple_matches()
 
-            replaced = text.replace(old, new) if params.replace_all else \
-                text.replace(old, new, 1)
-            replacements = count if params.replace_all else 1
+                replaced = text.replace(old, new) if params.replace_all else \
+                    text.replace(old, new, 1)
+                replacements = count if params.replace_all else 1
 
-            additions, deletions = _diff_counts(text, replaced)
-            patch = _patch(target.resource, text, replaced)
+                additions, deletions = _diff_counts(text, replaced)
+                patch = _patch(opened.resource, text, replaced)
 
-            had_bom = handle.had_bom
-            out = replaced.encode("utf-8")
-            filemut.modify(handle, filemut.join_bom(out, had_bom))
-        except BaseException:
-            handle.close()
-            raise
-        # marker from the handle we wrote through, before it closes
-        version = filemut.finish(handle)
+                had_bom = handle.had_bom
+                out = replaced.encode("utf-8")
+                filemut.modify(handle, filemut.join_bom(out, had_bom))
+            except BaseException:
+                handle.close()
+                raise
+            # marker from the handle we wrote through, before it closes
+            version = filemut.finish(handle)
 
     model_text = "\n".join(
         [
-            f"Edited file successfully: {target.resource}",
+            f"Edited file successfully: {opened.resource}",
             f"Replacements: {replacements}",
             "```diff",
             *_preview(params.old_string, "-"),
@@ -144,7 +152,7 @@ def _run(resolver: Resolver, config: Config, params: EditInput) -> tuple[dict, s
     result = {
         "files": [
             {
-                "file": target.resource,
+                "file": opened.resource,
                 "patch": patch,
                 "status": "modified",
                 "additions": additions,

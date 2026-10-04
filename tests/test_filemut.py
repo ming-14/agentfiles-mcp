@@ -65,9 +65,12 @@ def test_finish_marks_from_the_handle_not_the_path(tmp_path, monkeypatch):
     out a marker for a file the caller never wrote (fail-open on the next
     write)."""
     from agentfiles_server import filemut
+    from agentfiles_server.fslayer import Resolver
 
-    target = tmp_path / "f.txt"   # create_with_dirs needs the path to be free
-    handle = filemut.create_with_dirs(str(target), b"written\n")
+    target = tmp_path / "f.txt"
+    opened = Resolver(str(tmp_path)).create_file(str(target))
+    handle = filemut.adopt_created(opened)
+    filemut.modify(handle, b"written\n")
 
     def boom(*args, **kwargs):
         raise AssertionError("finish must not stat by path")

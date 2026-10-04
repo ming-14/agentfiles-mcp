@@ -171,21 +171,24 @@ def _state_changed(before: os.stat_result, after: os.stat_result) -> bool:
                         before.st_ino, before.st_dev)
 
 
-def open_verified(
-    canonical: str,
+def verify_opened(
+    opened,
     expected: Version | None,
     *,
     on_missing,
     on_mismatch,
-    create: bool,
     max_bytes: int | None = None,
     on_too_large=None,
     read_content: bool = True,
 ) -> VersionedFile | None:
-    """Open and verify ``canonical``; return None when the caller may create it.
+    """Adopt a handle that already passed containment/type/deny verification.
 
-    create=True (write tool only): an absent file with no expected version
-    yields None so the caller can do an O_EXCL create.
+    ``opened`` is an ``fslayer.Opened``; ownership of its fd transfers to the
+    returned VersionedFile on success, and is released here on failure (the
+    caller must not double-close). Returns None only when ``create`` semantics
+    apply and the caller may create the file -- encoded by callers checking
+    FileNotFoundError *before* reaching this function; kept for symmetry with
+    the old signature.
 
     ``max_bytes`` bounds what is pulled into memory (``on_too_large`` is
     required with it). It is checked on the verified handle -- after the CAS,
@@ -197,17 +200,7 @@ def open_verified(
     possibly huge old file into memory to learn whether it started with three
     marker bytes would buy nothing.
     """
-    try:
-        fd = os.open(canonical, os.O_RDWR | _O_BINARY)
-    except FileNotFoundError:
-        if expected is not None:
-            raise on_mismatch from None
-        if create:
-            return None
-        raise on_missing from None
-    except IsADirectoryError:
-        raise on_missing from None
-
+    fd = opened.fd
     try:
         if expected is None:
             # file exists but the client never read it
@@ -215,17 +208,20 @@ def open_verified(
         # One fstat: the CAS check, and the baseline verify_unchanged compares
         # against. It has to precede the read -- otherwise a modification
         # landing inside it becomes the baseline itself.
-        stat = os.fstat(fd)
-        _verify(stat, expected, canonical, on_mismatch)
-        if max_bytes is not None and stat.st_size > max_bytes:
+        st = opened.stat
+        _verify(st, expected, opened.real, on_mismatch)
+        if max_bytes is not None and st.st_size > max_bytes:
             raise on_too_large
         probe = _read_all(fd) if read_content else _read_prefix(fd, len(_BOM))
         had_bom, _ = split_bom(probe)
-        return VersionedFile(fd=fd, canonical=canonical,
+        opened.fd = -1  # ownership moves to the handle we return
+        return VersionedFile(fd=fd, canonical=opened.real,
                              content=probe if read_content else b"",
-                             had_bom=had_bom, before=stat)
+                             had_bom=had_bom, before=st)
     except BaseException:
-        os.close(fd)
+        # release the handle here so no path can leak it; the caller's
+        # ``with opened`` sees fd == -1 and stays a no-op
+        opened.close()
         raise
 
 
@@ -267,24 +263,6 @@ def modify(handle: VersionedFile, data: bytes) -> None:
         view = view[written:]
 
 
-def create_with_dirs(canonical: str, data: bytes) -> VersionedFile:
-    """Create parent directories and the file atomically (O_EXCL)."""
-    parent = os.path.dirname(canonical)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-    fd = os.open(canonical, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_BINARY, 0o664)
-    try:
-        view = memoryview(data)
-        while view:
-            written = os.write(fd, view)
-            view = view[written:]
-        return VersionedFile(fd=fd, canonical=canonical, content=b"",
-                             had_bom=False, before=os.fstat(fd))
-    except BaseException:
-        os.close(fd)
-        raise
-
-
 def finish(handle: VersionedFile) -> Version:
     """Close the handle and return the marker for what it holds.
 
@@ -300,10 +278,23 @@ def finish(handle: VersionedFile) -> Version:
         handle.close()
 
 
+def adopt_created(opened) -> VersionedFile:
+    """Wrap a freshly O_EXCL-created handle (already containment-verified)
+    for writing: creation carries no pre-state, so content is empty and the
+    baseline is the creation fstat. Ownership of the fd moves to the returned
+    handle (``opened`` is left neutralized, so its ``with`` is a no-op)."""
+    fd = opened.fd
+    opened.fd = -1
+    return VersionedFile(
+        fd=fd, canonical=opened.real, content=b"",
+        had_bom=False, before=opened.stat,
+    )
+
+
 __all__ = [
     "VersionedFile", "target_lock", "split_bom", "join_bom", "has_bom",
-    "version_of", "open_verified", "verify_unchanged",
-    "modify", "create_with_dirs", "finish",
+    "version_of", "verify_opened", "verify_unchanged",
+    "modify", "adopt_created", "finish",
     "ToolError", "version_missing_edit", "version_missing_write",
     "version_mismatch_edit", "version_mismatch_write",
 ]

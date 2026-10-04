@@ -82,6 +82,8 @@ def test_large_image_reads_head_and_tail_only(tmp_path, monkeypatch):
     """A 200KB image must never be slurped whole for a structural check."""
     import builtins
 
+    from agentfiles_server.fslayer import Resolver
+    from agentfiles_server.handlepath import OPEN_RDONLY
     from agentfiles_shared.transport import DownloadDescriptor
 
     filler = b"\x00" * (200_000 - len(PNG_SIG) - len(PNG_TRAILER))
@@ -89,7 +91,7 @@ def test_large_image_reads_head_and_tail_only(tmp_path, monkeypatch):
     image.write_bytes(PNG_SIG + filler + PNG_TRAILER)
 
     reads = {"bytes": 0}
-    genuine_open = builtins.open
+    genuine_fdopen = os.fdopen
 
     class CountingHandle:
         def __init__(self, handle):
@@ -110,13 +112,20 @@ def test_large_image_reads_head_and_tail_only(tmp_path, monkeypatch):
         def __getattr__(self, name):
             return getattr(self._handle, name)
 
-    def counting_open(*args, **kwargs):
-        handle = genuine_open(*args, **kwargs)
-        return CountingHandle(handle) if str(args[0]).endswith("big.png") else handle
+    def counting_fdopen(fd, *args, **kwargs):
+        handle = genuine_fdopen(fd, *args, **kwargs)
+        return CountingHandle(handle)
 
-    monkeypatch.setattr(readfs, "open", counting_open, raising=False)
+    monkeypatch.setattr(readfs.os, "fdopen", counting_fdopen)
 
-    result = readfs.read_file(str(image), "big.png", offset=None, limit=None)
+    resolver = Resolver(str(tmp_path))
+    opened = resolver.open_checked(
+        str(image), flags=OPEN_RDONLY, expect="file"
+    )
+    try:
+        result = readfs.read_opened(opened, offset=None, limit=None)
+    finally:
+        opened.close()
 
     assert isinstance(result, DownloadDescriptor)
     assert result.size == 200_000
@@ -127,11 +136,21 @@ def test_large_image_reads_head_and_tail_only(tmp_path, monkeypatch):
 
 # --- directory listing: locale is process-global -----------------------------
 
+def _open_dir(path):
+    from agentfiles_server.fslayer import Resolver
+    from agentfiles_server.handlepath import OPEN_RDONLY
+
+    resolver = Resolver(str(path))
+    return resolver.open_checked(str(path), flags=OPEN_RDONLY, expect="dir")
+
+
 def test_list_dir_sorts_dirs_first(tmp_path):
     (tmp_path / "bdir").mkdir()
     (tmp_path / "adir").mkdir()
     (tmp_path / "zfile.txt").write_text("x")
-    page = readfs.list_dir(str(tmp_path), offset=None, limit=None)
+    opened = _open_dir(tmp_path)
+    with opened:
+        page = readfs.list_dir(opened, offset=None, limit=None)
     paths = [entry["path"] for entry in page.entries]
     assert paths == ["adir" + os.sep, "bdir" + os.sep, "zfile.txt"]
 
@@ -140,7 +159,9 @@ def test_list_dir_restores_locale(tmp_path):
     """setlocale mutates process-global state: it must not leak past list_dir."""
     (tmp_path / "a").write_text("x")
     before = locale.setlocale(locale.LC_COLLATE)
-    readfs.list_dir(str(tmp_path), offset=None, limit=None)
+    opened = _open_dir(tmp_path)
+    with opened:
+        readfs.list_dir(opened, offset=None, limit=None)
     assert locale.setlocale(locale.LC_COLLATE) == before
 
 
@@ -153,7 +174,9 @@ def test_concurrent_listings_do_not_interleave_locale(tmp_path):
     def worker():
         try:
             for _ in range(10):
-                page = readfs.list_dir(str(tmp_path), offset=None, limit=None)
+                opened = _open_dir(tmp_path)
+                with opened:
+                    page = readfs.list_dir(opened, offset=None, limit=None)
                 assert len(page.entries) == 5
         except BaseException as exc:  # noqa: BLE001 - surfaced after the join
             failures.append(exc)
@@ -167,27 +190,21 @@ def test_concurrent_listings_do_not_interleave_locale(tmp_path):
     assert locale.setlocale(locale.LC_COLLATE) == before
 
 
-# --- errors report the resource, not the server-side path --------------------
+# --- type errors report the resource, not the server-side path ---------------
 
-def test_list_dir_error_reports_resource(tmp_path):
+def test_type_error_reports_resource(tmp_path):
+    """Opening a file as a directory must name the resource, never the
+    server-side absolute path (that job moved to open_checked)."""
     from agentfiles_shared.errors import ToolError
+
+    from agentfiles_server.fslayer import Resolver
+    from agentfiles_server.handlepath import OPEN_RDONLY
 
     target = tmp_path / "note.txt"
     target.write_text("x")
+    resolver = Resolver(str(tmp_path))
     with pytest.raises(ToolError) as exc:
-        readfs.list_dir(str(target), offset=1, limit=1, resource="note.txt")
+        resolver.open_checked(str(target), flags=OPEN_RDONLY, expect="dir")
+    assert exc.value.code == "path_kind"
     assert "note.txt" in exc.value.message
     assert str(tmp_path) not in exc.value.message
-
-
-def test_inspect_error_reports_resource(tmp_path):
-    from agentfiles_shared.errors import ToolError
-
-    with pytest.raises(ToolError) as exc:
-        readfs.inspect(str(tmp_path / "missing"), resource="missing")
-    assert exc.value.code == "path_kind"
-    assert "missing" in exc.value.message
-    assert str(tmp_path) not in exc.value.message
-
-    (tmp_path / "note.txt").write_text("x")
-    assert readfs.inspect(str(tmp_path / "note.txt")) == "file"

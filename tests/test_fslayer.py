@@ -1,4 +1,10 @@
-"""Resolver: containment, symlink escape, resource normalization."""
+"""Resolver: locate (strings only locate) + open_checked (the OS decides).
+
+The security contract changed from check-then-open to open-then-verify:
+  * locate() never authorizes -- it only rejects poison and joins cwd
+  * open_checked() authorizes against the OPEN HANDLE's kernel-resolved path
+  * containment/type/deny failures raise ToolError; the tools collapse them
+"""
 
 from __future__ import annotations
 
@@ -10,6 +16,7 @@ import pytest
 from agentfiles_shared.errors import ToolError
 
 from agentfiles_server.fslayer import Resolver, contains, slash
+from agentfiles_server.handlepath import OPEN_RDONLY
 
 
 @pytest.fixture()
@@ -21,40 +28,96 @@ def workspace(tmp_path: Path) -> Path:
     return root
 
 
-def test_relative_file_resolves_inside(workspace: Path):
-    resolved = Resolver(str(workspace)).resolve("src/main.ts")
-    assert not resolved.external
-    assert resolved.resource == "src/main.ts"
-    assert resolved.canonical == os.path.realpath(workspace / "src" / "main.ts")
+def open_ok(resolver: Resolver, path: str, **kw):
+    """open_checked with defaults for tests; always closes the handle."""
+    kw.setdefault("flags", OPEN_RDONLY)
+    kw.setdefault("expect", "any")
+    opened = resolver.open_checked(path, **kw)
+    opened.close()
+    return opened
 
 
-def test_absolute_inside_resolves(workspace: Path):
+# --- locate: poison + cwd joining, no authorization --------------------------
+
+def test_locate_absolute_is_normpath(workspace: Path):
     target = str(workspace / "src" / "main.ts")
-    resolved = Resolver(str(workspace)).resolve(target)
-    assert not resolved.external
-    assert resolved.resource == "src/main.ts"
+    assert Resolver(str(workspace)).locate(target, None) == os.path.normpath(target)
 
 
-def test_relative_escape_rejected(workspace: Path):
+def test_locate_relative_joins_cwd(workspace: Path):
+    full = Resolver(str(workspace)).locate("main.ts", str(workspace / "src"))
+    assert full == os.path.normpath(str(workspace / "src" / "main.ts"))
+
+
+def test_locate_relative_without_cwd_is_cwd_not_set(workspace: Path):
     with pytest.raises(ToolError) as exc:
-        Resolver(str(workspace)).resolve("../outside.txt")
+        Resolver(str(workspace)).locate("main.ts", None)
+    assert exc.value.code == "cwd_not_set"
+
+
+def test_locate_relative_with_relative_cwd_is_invalid(workspace: Path):
+    with pytest.raises(ToolError) as exc:
+        Resolver(str(workspace)).locate("main.ts", "not/absolute")
+    assert exc.value.code == "invalid_input"
+
+
+def test_poison_checks_live_in_the_schema():
+    """NUL / drive-relative rejection happens at input validation (pydantic),
+    before locate() ever sees the value -- locate only joins."""
+    from pydantic import ValidationError
+
+    from agentfiles_shared.schema import ReadInput
+
+    with pytest.raises(ValidationError):
+        ReadInput(path="a\x00b")
+    if os.name == "nt":
+        with pytest.raises(ValidationError):
+            ReadInput(path="C:foo")
+
+
+# --- open_checked: the handle decides ----------------------------------------
+
+def test_open_inside_succeeds(workspace: Path):
+    opened = open_ok(Resolver(str(workspace)), str(workspace / "src" / "main.ts"))
+    assert not opened.external
+    assert opened.resource == "src/main.ts"
+    assert opened.is_file
+
+
+def test_open_inside_via_relative_cwd(workspace: Path):
+    resolver = Resolver(str(workspace))
+    full = resolver.locate("src/main.ts", str(workspace))
+    opened = open_ok(resolver, full)
+    assert opened.resource == "src/main.ts"
+
+
+def test_resource_uses_forward_slashes(workspace: Path):
+    opened = open_ok(Resolver(str(workspace)), str(workspace / "src" / "main.ts"))
+    assert "\\" not in opened.resource
+
+
+def test_escape_is_path_escape_logged(workspace: Path):
+    """Lexical escape still opens (the kernel resolves ../) -- the handle's
+    real path lands outside containment and is rejected."""
+    resolver = Resolver(str(workspace))
+    full = resolver.locate("../outside.txt", str(workspace))
+    assert os.path.isfile(full)  # the kernel would open it; we must not serve it
+    with pytest.raises(ToolError) as exc:
+        open_ok(resolver, full)
     assert exc.value.code == "path_escape"
-    assert "relative_escape" in exc.value.message
 
 
 def test_external_absolute_rejected_without_whitelist(workspace: Path, tmp_path: Path):
-    target = str(tmp_path / "outside.txt")
     with pytest.raises(ToolError) as exc:
-        Resolver(str(workspace)).resolve(target)
+        open_ok(Resolver(str(workspace)), str(tmp_path / "outside.txt"))
     assert exc.value.code == "path_escape"
-    assert "external_directory" in exc.value.message
 
 
 def test_external_absolute_allowed_with_whitelist(workspace: Path, tmp_path: Path):
-    target = str(tmp_path / "outside.txt")
-    resolved = Resolver(str(workspace), [str(tmp_path)]).resolve(target)
-    assert resolved.external
-    assert resolved.resource == slash(target)
+    resolver = Resolver(str(workspace), [str(tmp_path)])
+    opened = open_ok(resolver, str(tmp_path / "outside.txt"))
+    assert opened.external
+    assert opened.resource == slash(str(tmp_path / "outside.txt"))
 
 
 def test_whitelist_is_prefix_scoped(workspace: Path, tmp_path: Path):
@@ -63,27 +126,132 @@ def test_whitelist_is_prefix_scoped(workspace: Path, tmp_path: Path):
     (allowed / "note.md").write_text("x")
     other = tmp_path / "other"
     other.mkdir()
+    (other / "note.md").write_text("y")
     resolver = Resolver(str(workspace), [str(allowed)])
-    assert resolver.resolve(str(allowed / "note.md")).external
+    assert open_ok(resolver, str(allowed / "note.md")).external
     with pytest.raises(ToolError):
-        resolver.resolve(str(other / "note.md"))
-
-
-def test_resource_uses_forward_slashes(workspace: Path):
-    resolved = Resolver(str(workspace)).resolve("src/main.ts")
-    assert "\\" not in resolved.resource
+        open_ok(resolver, str(other / "note.md"))
 
 
 def test_symlink_escape_rejected(workspace: Path, tmp_path: Path):
+    """The whole point of open-then-verify: the kernel resolves the link and
+    the handle's real path is outside containment."""
     link = workspace / "leak"
+    outside_file = tmp_path / "outside.txt"
     try:
-        os.symlink(str(tmp_path), str(link))
+        os.symlink(str(outside_file), str(link))
     except (OSError, NotImplementedError):
         pytest.skip("symlinks unavailable on this platform")
     with pytest.raises(ToolError) as exc:
-        Resolver(str(workspace)).resolve("leak/outside.txt")
+        open_ok(Resolver(str(workspace)), str(link))
     assert exc.value.code == "path_escape"
 
+
+def test_expect_type_mismatch_is_path_kind(workspace: Path):
+    resolver = Resolver(str(workspace))
+    with pytest.raises(ToolError) as exc:
+        open_ok(resolver, str(workspace / "src"), expect="file")
+    assert exc.value.code == "path_kind"
+
+
+def test_devices_and_pipes_are_rejected(workspace: Path, tmp_path: Path):
+    """Only regular files and directories: a FIFO must not hang us, a device
+    must not be touched."""
+    if not hasattr(os, "mkfifo"):
+        pytest.skip("no POSIX FIFOs on this platform")
+    fifo = tmp_path / "pipe"
+    try:
+        os.mkfifo(str(fifo))
+    except (OSError, NotImplementedError):
+        pytest.skip("mkfifo unavailable on this platform")
+    # symlink it into the workspace so containment passes and TYPE is the rule
+    link = workspace / "pipe"
+    try:
+        os.symlink(str(fifo), str(link))
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks unavailable on this platform")
+    resolver = Resolver(str(workspace))
+    with pytest.raises(ToolError) as exc:
+        open_ok(resolver, str(link))
+    assert exc.value.code == "path_kind"
+
+
+# --- deny ---------------------------------------------------------------------
+
+def test_deny_matches_real_resource(workspace: Path, tmp_path: Path):
+    """good.txt symlinked to .env: the handle's real path is .env -> denied."""
+    secret = workspace / ".env"
+    secret.write_text("S=1")
+    link = workspace / "good.txt"
+    try:
+        os.symlink(str(secret), str(link))
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks unavailable on this platform")
+    resolver = Resolver(str(workspace))
+    with pytest.raises(ToolError) as exc:
+        open_ok(resolver, str(link), deny=["*.env"],
+                on_deny=ToolError("read_deny", "denied"))
+    assert exc.value.code == "read_deny"
+
+
+def test_deny_matches_lexical_resource(workspace: Path, tmp_path: Path):
+    """notes.txt symlinked pointing AT .env is denied by its real resource."""
+    secret = workspace / ".env"
+    secret.write_text("S=1")
+    link = workspace / "notes.txt"
+    try:
+        os.symlink(str(secret), str(link))
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks unavailable on this platform")
+    resolver = Resolver(str(workspace))
+    with pytest.raises(ToolError):
+        open_ok(resolver, str(link), deny=["*.env"],
+                on_deny=ToolError("read_deny", "denied"))
+
+
+def test_deny_miss_allows(workspace: Path):
+    resolver = Resolver(str(workspace))
+    opened = open_ok(resolver, str(workspace / "src" / "main.ts"),
+                     deny=["*.env"], on_deny=ToolError("read_deny", "denied"))
+    assert opened.resource == "src/main.ts"
+
+
+# --- create_file: parent verified first, deny before side effects ------------
+
+def test_create_makes_parents(workspace: Path):
+    resolver = Resolver(str(workspace))
+    target = str(workspace / "a" / "b" / "c.txt")
+    opened = resolver.create_file(target)
+    try:
+        assert opened.is_file
+        assert opened.resource == "a/b/c.txt"
+    finally:
+        opened.close()
+    assert (workspace / "a" / "b" / "c.txt").exists()
+
+
+def test_create_denied_makes_no_side_effect(workspace: Path):
+    resolver = Resolver(str(workspace))
+    target = str(workspace / "app.env.local")
+    with pytest.raises(ToolError) as exc:
+        resolver.create_file(target, deny=["*.env.*"],
+                             on_deny=ToolError("write_deny", "denied"))
+    assert exc.value.code == "write_deny"
+    # deny is matched before makedirs: nothing was created
+    assert not (workspace / "app.env.local").exists()
+    assert not (workspace / "src" / "app.env.local").exists()
+
+
+def test_create_outside_containment_rejected(workspace: Path, tmp_path: Path):
+    resolver = Resolver(str(workspace))
+    target = str(tmp_path / "nope.txt")
+    with pytest.raises(ToolError) as exc:
+        resolver.create_file(target)
+    assert exc.value.code == "path_escape"
+    assert not (tmp_path / "nope.txt").exists()
+
+
+# --- containment helpers -------------------------------------------------------
 
 def test_contains_rule(tmp_path: Path):
     parent = str(tmp_path)
@@ -98,21 +266,3 @@ def test_contains_cross_drive_is_false_not_error():
         pytest.skip("cross-drive paths only exist on Windows")
     assert contains(r"C:\ws", r"D:\data\x.txt") is False
     assert contains(r"D:\whitelist", r"C:\ws\x.txt") is False
-
-
-def test_cross_drive_absolute_path_is_path_escape():
-    """A path on another drive is external, so it fails as path_escape (never a
-    ValueError that the app would surface as `internal`)."""
-    if os.name != "nt":
-        pytest.skip("cross-drive paths only exist on Windows")
-    with pytest.raises(ToolError) as exc:
-        Resolver("C:/ws").resolve("D:/data/x.txt")
-    assert exc.value.code == "path_escape"
-
-
-def test_cross_drive_absolute_path_is_not_whitelisted():
-    if os.name != "nt":
-        pytest.skip("cross-drive paths only exist on Windows")
-    with pytest.raises(ToolError) as exc:
-        Resolver("C:/ws", ["C:/allowed"]).resolve("D:/data/x.txt")
-    assert exc.value.code == "path_escape"

@@ -8,6 +8,7 @@ import httpx
 import pytest
 
 import agentfiles_mcp.server as mcp_server
+from agentfiles_mcp import cwd as cwd_state
 from agentfiles_mcp.client import ToolClient
 from agentfiles_mcp.config import Config as ClientConfig
 from agentfiles_mcp.receipts import ReceiptBook
@@ -39,6 +40,8 @@ def wired(tmp_path, monkeypatch):
     monkeypatch.setattr(mcp_server, "_client", tool_client)
     book = ReceiptBook()
     monkeypatch.setattr(mcp_server, "_receipts", book)
+    # relative paths resolve against the proxy's cwd: set it for these tests
+    monkeypatch.setattr(cwd_state, "_cwd", str(workspace))
     return workspace, book
 
 

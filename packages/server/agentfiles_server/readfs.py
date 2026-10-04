@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from agentfiles_shared.errors import binary_file, image_decode, \
-    media_ingest_limit, malformed_utf8, offset_out_of_range, path_kind
+    media_ingest_limit, malformed_utf8, offset_out_of_range
 from agentfiles_shared.schema import (
     MAX_LINE_LENGTH,
     MAX_LINE_SUFFIX,
@@ -103,20 +103,6 @@ class ListPage:
         if self.next is not None:
             result["next"] = self.next
         return result
-
-
-def inspect(path: str, resource: str | None = None) -> str:
-    """Return "file" | "directory"; raise path_kind for anything else.
-
-    ``resource`` is what goes into the error message (workspace-relative, so a
-    server path never leaks into a message other callers may surface);
-    ``path`` is only the filesystem location to inspect.
-    """
-    if os.path.isfile(path):
-        return "file"
-    if os.path.isdir(path):
-        return "directory"
-    raise path_kind(resource if resource is not None else path, "a file or directory")
 
 
 def mime_type(path: str) -> str:
@@ -216,28 +202,28 @@ def _validate_image(mime: str, head: bytes, tail: bytes, size: int) -> bool:
 
 # --- file reading -------------------------------------------------------------
 
-def read_file(
-    absolute: str, resource: str, *, offset: int | None, limit: int | None
+def read_opened(
+    opened, *, offset: int | None, limit: int | None
 ) -> Content | TextPage | DownloadDescriptor:
-    """V2 read(): image transport / full text / paged text.
+    """V2 read() over an already-opened, containment-verified handle.
 
-    Text results carry the write/edit receipt: an fstat of the handle the
-    bytes are read through, taken *before* the first read. A path stat taken
-    afterwards (or an fstat after the read) could describe a file swapped in
-    during the read, and that marker would then verify as "unchanged" for
-    content nobody ever saw.
+    The caller owns ``opened``; this function only reads through its fd (the
+    descriptor is left open -- the tool closes it). Text results carry the
+    write/edit receipt: the fstat taken at open time, before any read. A path
+    stat taken afterwards (or an fstat after the read) could describe a file
+    swapped in during the read, and that marker would then verify as
+    "unchanged" for content nobody ever saw.
     """
-    real = os.path.realpath(absolute)
-    if not os.path.isfile(real):
-        raise path_kind(resource, "a file")
-
-    with open(real, "rb") as handle:
-        # one fstat, before any read: receipt source and authoritative size.
-        # The size is deliberately the handle's, not a fresh os.path.getsize:
-        # a file that grows after this point is under-read (a shorter sniff
-        # sample, a shorter page) rather than described by a size that never
-        # matched the bytes we are about to return.
-        marker = version_of(handle.fileno(), absolute)
+    resource = opened.resource
+    real = opened.real
+    handle = os.fdopen(os.dup(opened.fd), "rb")
+    with handle:
+        # one fstat at open, before any read: receipt source and authoritative
+        # size. The size is deliberately the handle's, not a fresh
+        # os.path.getsize: a file that grows after this point is under-read
+        # rather than described by a size that never matched the bytes we
+        # are about to return.
+        marker = version_of(opened.fd, real)
         size = marker.size
         first = handle.read(min(64 * 1024, size or 4 * 1024))
 
@@ -426,17 +412,22 @@ def _sort_entries(entries: list[dict]) -> None:
                     pass
 
 
-def list_dir(absolute: str, *, offset: int | None, limit: int | None,
-             resource: str | None = None) -> ListPage:
-    """V2 list(): reject escaping symlinks, dirs first, locale-aware sort."""
-    real = os.path.realpath(absolute)
-    if not os.path.isdir(real):
-        # report the resource, never the server-side absolute path
-        raise path_kind(resource if resource is not None else absolute,
-                        "a file or directory")
+def list_dir(opened, *, offset: int | None, limit: int | None) -> ListPage:
+    """V2 list() over a containment-verified directory handle.
+
+    Listing walks ``opened.real`` (the kernel-resolved path of the handle we
+    already verified): POSIX could list the fd directly, but Windows cannot
+    (os.listdir rejects int), so one code path uses the verified real path --
+    the documented directory-only micro-race. Each child is re-checked with
+    realpath + contains below, so entries escaping the verified directory are
+    dropped regardless.
+    """
+    real = opened.real
+
+    names = _list_names(opened)
 
     entries: list[dict] = []
-    for name in os.listdir(real):
+    for name in names:
         child = os.path.join(real, name)
         try:
             target = os.path.realpath(child)
@@ -465,9 +456,17 @@ def list_dir(absolute: str, *, offset: int | None, limit: int | None,
     return ListPage(entries=selected, truncated=truncated, next=next_offset)
 
 
+def _list_names(opened) -> list[str]:
+    try:
+        return os.listdir(opened.fd)  # POSIX: names straight off the handle
+    except (TypeError, OSError):
+        # Windows has no fd-based listdir; use the verified real path
+        return os.listdir(opened.real)
+
+
 __all__ = [
     "Content", "TextPage", "ListPage",
-    "inspect", "read_file", "list_dir",
+    "read_opened", "list_dir",
     "image_mime", "is_binary", "mime_type",
     "BINARY_EXTENSIONS", "MIN_BINARY_SAMPLE_BYTES",
 ]

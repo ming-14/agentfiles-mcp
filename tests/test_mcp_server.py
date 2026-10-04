@@ -22,6 +22,9 @@ MODELS = {
     "grep": GrepInput,
 }
 
+# tools whose parameters are not schema-sourced (plain strings / no input)
+EXTRA_TOOLS = {"workspace", "set_cwd"}
+
 
 class RecordingClient:
     """Stands in for ToolClient; records the payload that would go on the wire."""
@@ -42,16 +45,18 @@ class RecordingClient:
 
 
 # Internal-only wire fields: the MCP layer manages these itself (version
-# receipts are attached/recorded by the proxy, invisible to the model).
-INTERNAL_FIELDS = {"expectedVersion"}
+# receipts and the request cwd are attached/recorded by the proxy, invisible
+# to the model).
+INTERNAL_FIELDS = {"expectedVersion", "cwd"}
 
 
 async def test_tool_schemas_are_single_sourced():
     """Every MCP input schema must equal the shared schema model's schema —
     the FieldInfo is borrowed, so drift is structurally impossible.
-    Internal-only fields (version receipts) are hidden from the model."""
+    Internal-only fields (version receipts, request cwd) are hidden from the
+    model; workspace/set_cwd take plain parameters with no schema to source."""
     tools = {tool.name: tool for tool in await server.mcp.list_tools()}
-    assert set(tools) == set(MODELS)
+    assert set(tools) == set(MODELS) | EXTRA_TOOLS
     for name, model in MODELS.items():
         want = model.model_json_schema()
         got = tools[name].inputSchema

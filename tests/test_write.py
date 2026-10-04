@@ -41,12 +41,23 @@ def make_client(workspace, **overrides) -> TestClient:
         write_deny=overrides.get("write_deny", ["*.env", "*.env.*"]),
         external_whitelist=overrides.get("external_whitelist", []),
     )
-    return TestClient(create_app(config))
+    client = TestClient(create_app(config))
+    client.af_workspace = str(workspace)
+    return client
+
+
+def _with_cwd(client, payload: dict) -> dict:
+    """Attach the request cwd unless the test set one explicitly (None = test
+    the cwd_not_set rejection)."""
+    payload.setdefault("cwd", getattr(client, "af_workspace", None))
+    return payload
 
 
 def read_version(client, path: str) -> dict:
     """Simulates the model's prior read: returns the version marker."""
-    data = signed_post(client, "/v1/read", {"path": path}).json()
+    data = signed_post(
+        client, "/v1/read", _with_cwd(client, {"path": path})
+    ).json()
     assert data["ok"], data
     return data["result"]["version"]
 
@@ -55,7 +66,7 @@ def write(client, path: str, content: str, version: dict | None = None):
     payload: dict = {"path": path, "content": content}
     if version is not None:
         payload["expectedVersion"] = version
-    return signed_post(client, "/v1/write", payload).json()
+    return signed_post(client, "/v1/write", _with_cwd(client, payload)).json()
 
 
 def touch(path, extra_sleep: bool = True):
@@ -200,6 +211,7 @@ def test_write_deny_blocks_even_after_read(workspace):
         write_deny=["*.env"],
     )
     with TestClient(create_app(config)) as client:
+        client.af_workspace = str(workspace)
         version = read_version(client, ".env")
         data = write(client, ".env", "clobber", version)
     assert data["error"]["code"] == "write_deny"
@@ -216,7 +228,10 @@ def test_read_deny_write_allowed_when_separate(workspace):
         write_deny=[],
     )
     with TestClient(create_app(config)) as client:
-        read_data = signed_post(client, "/v1/read", {"path": ".env"}).json()
+        client.af_workspace = str(workspace)
+        read_data = signed_post(
+            client, "/v1/read", {"path": ".env", "cwd": str(workspace)}
+        ).json()
         data = write(client, ".env", "NEW=1")
     assert read_data["error"]["message"] == "Unable to read .env"
     assert data["ok"] is True
@@ -244,7 +259,8 @@ def test_relative_escape_rejected(workspace, tmp_path):
     (tmp_path / "out.txt").write_bytes(b"x")
     with make_client(workspace) as client:
         data = write(client, "../out.txt", "clobber")
-    assert data["error"]["code"] == "path_escape"
+    # unified surface: escape reads exactly like any other write failure
+    assert data["error"]["code"] == "unable_to_write"
     assert (tmp_path / "out.txt").read_bytes() == b"x"
 
 

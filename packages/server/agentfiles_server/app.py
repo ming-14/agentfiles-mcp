@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
 from typing import TypeVar
 
@@ -10,17 +11,19 @@ from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, ValidationError
 from starlette.concurrency import run_in_threadpool
 
-from agentfiles_shared.errors import ToolError, invalid_input
+from agentfiles_shared.errors import ToolError, invalid_cwd, invalid_input
 from agentfiles_shared.schema import (
     EditInput,
     GlobInput,
     GrepInput,
     ReadInput,
     WriteInput,
+    check_path_value,
 )
 
 from .config import Config
 from .fslayer import Resolver
+from .handlepath import OPEN_RDONLY
 from .middleware import AuthMiddleware, parse_body
 from .tools import edit, glob, grep, read, write
 from .transport import download
@@ -113,5 +116,52 @@ def create_app(config: Config) -> FastAPI:
         # Signature (including the signed query) was verified by the middleware;
         # FileResponse preparation is sync file IO, so keep it off the loop.
         return await run_in_threadpool(download, resolver, config, path)
+
+    @app.get("/v1/workspace")
+    async def workspace() -> JSONResponse:
+        """The configured workspace root (kernel-resolved). Lets the model see
+        where relative paths anchor; read-only, contains nothing sensitive
+        beyond the root the caller is already authorized against."""
+        return JSONResponse(content={"ok": True, "workspace": resolver.root})
+
+    @app.post("/v1/cwd")
+    async def set_cwd(request: Request) -> JSONResponse:
+        """Validate a working directory through a handle and return its
+        kernel-resolved path. Relative input resolves against the workspace
+        root (the client has no cwd yet -- that is what it is setting).
+        One error covers missing / not-a-directory / outside containment, so
+        set_cwd cannot be used to map the server's filesystem either."""
+        try:
+            body = parse_body(request)
+            path = body.get("path")
+            if not isinstance(path, str) or not path:
+                raise invalid_input("path must be a non-empty string")
+            check_path_value(path)
+            full = path if os.path.isabs(path) else os.path.join(resolver.root, path)
+            opened = resolver.open_checked(
+                os.path.normpath(full), flags=OPEN_RDONLY, expect="dir"
+            )
+            opened.close()
+        except ToolError as exc:
+            if exc.code == "invalid_input":
+                return JSONResponse(
+                    status_code=200, content={"ok": False, "error": exc.to_payload()}
+                )
+            return JSONResponse(
+                status_code=200,
+                content={"ok": False, "error": invalid_cwd(str(path)).to_payload()},
+            )
+        except ValueError as exc:
+            # check_path_value (NUL / drive-relative)
+            return JSONResponse(
+                status_code=200,
+                content={"ok": False, "error": invalid_input(str(exc)).to_payload()},
+            )
+        except OSError:
+            return JSONResponse(
+                status_code=200,
+                content={"ok": False, "error": invalid_cwd(str(path)).to_payload()},
+            )
+        return JSONResponse(content={"ok": True, "cwd": opened.real})
 
     return app

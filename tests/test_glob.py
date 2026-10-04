@@ -51,10 +51,13 @@ def make_client(workspace, **overrides) -> TestClient:
         ripgrep_path=overrides.get("ripgrep_path"),
         rg_timeout=overrides.get("rg_timeout", 15.0),
     )
-    return TestClient(create_app(config))
+    client = TestClient(create_app(config))
+    client.af_workspace = str(workspace)
+    return client
 
 
 def glob(client, **payload):
+    payload.setdefault("cwd", getattr(client, "af_workspace", None))
     return signed_post(client, "/v1/glob", payload).json()
 
 
@@ -128,7 +131,9 @@ def test_relative_escape_rejected(workspace, tmp_path):
     with make_client(workspace) as client:
         data = glob(client, pattern="*", path="../")
     assert data["ok"] is False
-    assert data["error"]["code"] == "path_escape"
+    # V2 semantics: every glob failure collapses into the generic message
+    assert data["error"]["code"] == "unable_to_find"
+    assert data["error"]["message"] == "Unable to find files matching *"
 
 
 def test_path_must_be_directory(workspace):

@@ -151,9 +151,11 @@ def unable_to_grep(pattern: str) -> ToolError:
 
 
 # Codes glob and grep pass through to the model verbatim; any other failure
-# collapses into the generic "Unable to ..." text above.
+# collapses into the generic "Unable to ..." text above. path_escape is
+# deliberately NOT here: containment failures must not tell the model whether
+# a probed path exists outside the workspace (the reason is logged server-side).
 SEARCH_TRANSPARENT_CODES = frozenset(
-    {"path_escape", "rg_unavailable", "rg_timeout", "rg_failed"}
+    {"rg_unavailable", "rg_timeout", "rg_failed", "invalid_input", "cwd_not_set"}
 )
 
 
@@ -173,8 +175,27 @@ def invalid_input(detail: str) -> ToolError:
 
 
 def path_escape(path: str, reason: str) -> ToolError:
-    """reason: relative_escape | location_escape | non_directory_ancestor"""
+    """Internal only: tools collapse this into their generic Unable-to message
+    (server-side logging keeps the reason; the model must not learn whether a
+    path exists outside the workspace)."""
     return ToolError("path_escape", f"Unable to resolve {path} ({reason})")
+
+
+def cwd_not_set() -> ToolError:
+    return ToolError(
+        "cwd_not_set",
+        "No working directory set. Use the set_cwd tool to set one, or use an absolute path.",
+    )
+
+
+def invalid_cwd(path: str) -> ToolError:
+    """set_cwd rejection: missing, not a directory, or outside containment --
+    one message for all three, so the model cannot probe the server's
+    filesystem through the differences."""
+    return ToolError(
+        "invalid_cwd",
+        f"Not an accessible directory in the workspace: {path}",
+    )
 
 
 def unauthorized(detail: str = "Invalid or missing credentials") -> ToolError:

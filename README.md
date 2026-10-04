@@ -43,6 +43,45 @@ Headers:
 `unknown_token` → 时间戳 / nonce / 签名。签名头的存在性检查排在 token 查询之前，
 所以一个不带签名头的请求永远拿不到 `unknown_token`，无法据此枚举有效 token。
 
+### 打开即验证（open-then-verify）
+
+**路径字符串只用来「找到」文件，不作任何安全依据；所有裁决针对「实际打开的
+那个文件句柄」的内核真实路径**（Windows `GetFinalPathNameByHandleW`、Linux
+`/proc/self/fd`、macOS `F_GETPATH`）。客户端可以发送任意路径穿越，因为判定的
+是终点：
+
+```
+① 毒性检查   空字节 / 盘符相对 "C:foo" → invalid_input（schema 层，纯拒绝）
+② 定位       绝对路径原样；相对路径 join(cwd, path)，无 cwd → cwd_not_set
+③ 实际打开   操作系统解析 .、..、符号链接、junction（O_NONBLOCK 防 FIFO 挂起）
+④ 句柄裁决   真身路径 ∈ workspace/白名单？ → 否：拒绝（日志留因，模型只见归并文案）
+             fstat 类型 ∈ {普通文件, 目录}？  → 否：拒绝（设备/socket/管道一律不服务）
+             deny 匹配真身资源名？            → 命中：拒绝
+⑤ 后续所有 IO 只用这个 fd——验证过的就是读/写的那个，无二次按路径打开
+```
+
+四条缺一不可：**②** 拦截无 cwd 的相对路径；**④** 第一条防穿越/链接（句柄级，
+无 TOCTOU 窗口）；**④** 第二条防打开副作用（FIFO 挂起、设备触碰）；**④** 第三条 +
+错误归并防文件系统测绘——「workspace 外存在」「不存在」「被 deny」三种情况对模型
+呈现**同一条** `Unable to read <path>`（原因只进服务端日志）。
+
+**cwd 与 workspace 是两个概念**：
+- **workspace** = 服务端配置的 `AF_WORKSPACE`，固定不变，安全边界
+- **cwd** = MCP 客户端**每请求**携带的字段（不是进程状态——服务端并发，绝不能
+  `chdir`），相对路径以它为基准。它被校验但**不被信任**：最终打开的文件自己会
+  被句柄验证，cwd 只影响「定位」
+
+MCP 侧流程：启动时 cwd 为空 → 相对路径请求被 `cwd_not_set` 拦截（不落任何默认
+基准）→ 模型调用 `set_cwd` → 客户端问服务端 `POST /v1/cwd`（打开目录句柄验证，
+返回内核真身路径）→ 客户端存下规范形 → 后续请求原样附上。`workspace` 工具可
+随时查看服务端根目录。
+
+**目录列表与 ripgrep 是唯一的句柄级残留窗口**：Windows 无 fd 列目录（`os.listdir`
+不接受 int），列表用已验证的真身路径走一次；rg 收到的也是已验证的真身路径，
+但其内部遍历与后续打开不经我们句柄。两者内容级防线是：目录列表逐项
+`realpath + contains` 过滤、rg 默认不跟随符号链接——**文件内容的读与写则全部
+经句柄，零窗口**。
+
 ### 文件传输（transport）
 
 工具响应**从不内联文件字节**——图片也不例外。`read` 到图片时返回下载描述符：
@@ -103,7 +142,9 @@ write/edit 采用**严格模式**：写入必须发生在通过校验的那个�
   `unable_to_edit`，不会漏成 `internal`
 - 无回执 → `version_missing`（`Read the file before editing it.`）
 - 不符 → `version_mismatch`（`File changed since it was last read. ...`）
-- 回执表在 MCP 进程内存（LRU 512），**不落盘**：重启即失效，fail-closed
+- 回执表在 MCP 进程内存（LRU 512），**键是 (cwd, path)**：同一相对拼写在
+  `set_cwd` 之后指的是另一个文件，回执不随拼写跨 cwd 迁移；**不落盘**——重启
+  即失效，fail-closed
 
 write 的特例：文件不存在且无回执 → 直接创建（`O_EXCL`，父目录自动建）；
 文件已存在且无回执 → 拒绝覆盖。
@@ -142,9 +183,9 @@ grep 反而带 `--hidden`（会搜隐藏文件），因此更依赖 deny 转出�
 行，于是所有搜索都返回空（方向是安全的——不会泄漏，但运维毫无感知）。启动时
 会用空目录探测一遍 `AF_READ_DENY`，非法则在 stderr 告警。
 
-与 V2 的有意差异：V2 的 glob/grep 对 `path` **没有**逃逸校验，我们走
-`resolver.resolve()`；结果路径在 workspace 内是相对路径，白名单外部则返回
-绝对路径。modelText 一律渲染绝对路径（对齐 V2 渲染前的 resolve）。
+与 V2 的有意差异：V2 的 glob/grep 对 `path` **没有**逃逸校验，我们对搜索根走
+`open_checked()`（句柄级验证）；结果路径在 workspace 内是相对路径，白名单外部则
+返回绝对路径。modelText 一律渲染绝对路径（对齐 V2 渲染前的 resolve）。
 
 ## 服务端
 
@@ -177,13 +218,18 @@ python -m agentfiles_server
 
 ```
 GET  /healthz                        探活（免签名）
-POST /v1/read    {path, offset?, limit?}
-POST /v1/write   {path, content}
-POST /v1/edit    {path, oldString, newString, replaceAll?}
-POST /v1/glob    {pattern, path?, limit?}
-POST /v1/grep    {pattern, path?, include?, limit?}
+GET  /v1/workspace                   服务端根目录（签名）
+POST /v1/cwd          {path}         校验并返回 cwd 规范形（签名）
+POST /v1/read    {path, cwd?, offset?, limit?}
+POST /v1/write   {path, cwd?, content, expectedVersion?}
+POST /v1/edit    {path, cwd?, oldString, newString, replaceAll?, expectedVersion?}
+POST /v1/glob    {pattern, cwd?, path?, limit?}
+POST /v1/grep    {pattern, cwd?, path?, include?, limit?}
 GET  /v1/transport/download?path=<abs>   拉取文件字节（query 参与签名）
 ```
+
+`cwd` 是**内部字段**（MCP 客户端附带，模型不可见）：相对路径的解析基准，
+每请求校验，服务端不存任何会话状态。
 
 请求体必须是 JSON 对象，并按 `agentfiles_shared.schema` 的输入模型校验。
 非 JSON、非对象、缺字段或字段越界一律返回 `error.code = invalid_input`
@@ -217,8 +263,8 @@ GET  /v1/transport/download?path=<abs>   拉取文件字节（query 参与签名
 | 状态 | 含义 |
 |---|---|
 | `400` | `path` 为空或不是绝对路径（`invalid_input`） |
-| `403` | containment 逃逸（`path_escape`）或命中 `AF_READ_DENY`（`unable_to_read`） |
-| `404` | 目标不存在或不是文件（`transport_unavailable`） |
+| `403` | 命中 `AF_READ_DENY`（`unable_to_read`） |
+| `404` | 不存在、不是文件、**或 containment 逃逸**——三者同一文案（`transport_unavailable`），该通道无法用来测绘 workspace 外部 |
 | `413` | 超过 `AF_TRANSPORT_MAX`（`transport_too_large`） |
 
 ## 本地 MCP
@@ -251,7 +297,13 @@ GET  /v1/transport/download?path=<abs>   拉取文件字节（query 参与签名
 }
 ```
 
-暴露的 MCP 工具：`read`、`write`、`edit`、`glob`、`grep`。
+暴露的 MCP 工具：`read`、`write`、`edit`、`glob`、`grep`，外加两个 cwd 工具：
+
+- **`workspace`** — 查看服务端 workspace 根目录与当前 cwd
+- **`set_cwd(path)`** — 让服务端验证目录（打开句柄确认存在、是目录、在
+  containment 内），存下返回的规范形；成功后相对路径才可用。**失败不改变当前
+  cwd**，且 missing / 非目录 / 越界三种失败同一文案（`invalid_cwd`），模型无法
+  借它测绘服务端文件系统
 
 工具参数的描述与取值约束直接取自 `agentfiles_shared.schema` 的输入模型，
 MCP 输入 schema 与 REST 请求体校验是同一份定义，改一处两边同步生效。
@@ -291,15 +343,18 @@ packages/server/agentfiles_server/
   app.py           FastAPI 装配 + transport 路由
   middleware.py    认证链：bearer → 签名头 → token → 时间戳 → nonce → 签名 → 重放
   config.py        环境变量配置（数值解析 / 白名单 / 读写黑名单 / 传输上限）
-  fslayer.py       路径解析 / 逃逸校验 / 外部白名单
+  fslayer.py       locate（字符串只定位）+ open_checked（句柄级裁决）+ create_file
+  handlepath.py    平台层：句柄真实路径（Win GetFinalPathNameByHandleW / proc fd /
+                   F_GETPATH）+ Windows 目录句柄
   filemut.py       严格模式句柄读写 + version 校验 + 目标锁 + BOM
   readfs.py        read 引擎：嗅探、分页、目录列表、图片校验；文本回执在此取 fstat
   rg.py            ripgrep 适配：spawn / 超时兜底 / 退出码映射 / 行与记录上限 / deny 排除与启动期校验
   transport.py     签名下载端点（containment + read-deny + 大小校验）
   tools/           read write edit glob grep
 packages/mcp/agentfiles_mcp/
-  server.py        FastMCP 工具定义 + 回执记账
-  receipts.py      version 回执表（LRU，进程内存）
+  server.py        FastMCP 工具定义 + 回执记账 + workspace/set_cwd
+  cwd.py           每进程 cwd 状态（空起步，相对路径被拦）
+  receipts.py      version 回执表（LRU，键为 (cwd, path)）
   client.py        带签名的 HTTP 客户端（POST + 下载）
   transport.py     下载落盘（temp 目录、.part 原子改名）
   config.py        环境变量配置

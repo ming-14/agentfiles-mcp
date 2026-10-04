@@ -7,9 +7,10 @@ can expose the same JSON schema the model is trained against.
 
 from __future__ import annotations
 
+import re
 from typing import Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 # --- constants (packages/core/src/tool/read-filesystem.ts) ----------------
 
@@ -24,6 +25,52 @@ MAX_MEDIA_INGEST_BYTES = 20 * 1024 * 1024
 DEFAULT_IMAGE_MAX_WIDTH = 2_000
 DEFAULT_IMAGE_MAX_HEIGHT = 2_000
 DEFAULT_IMAGE_MAX_BASE64_BYTES = 5 * 1024 * 1024
+
+
+# --- path hygiene (shared by every input model) -----------------------------
+
+# Drive-relative "C:foo" is NOT absolute but os.path.join discards the base for
+# it, resolving against the process drive cwd -- never acceptable as input.
+_DRIVE_RELATIVE = re.compile(r"^[A-Za-z]:[^\\/]")
+
+
+def check_path_value(value: str) -> str:
+    """Reject path values no filesystem API can handle safely.
+
+    NUL truncates in some syscalls and raises ValueError in others; drive-
+    relative paths are nondeterministic. Both surface as invalid_input.
+    """
+    if "\x00" in value:
+        raise ValueError("path contains a null byte")
+    if _DRIVE_RELATIVE.match(value):
+        raise ValueError("drive-relative paths (C:foo) are not supported")
+    return value
+
+
+class PathInput(BaseModel):
+    """Adds the poison checks and the internal ``cwd`` field.
+
+    ``cwd`` is attached by the MCP proxy (never model-visible): relative paths
+    resolve against it, server-side, per request. It is validated but not
+    trusted -- the file ultimately opened is what gets containment-checked.
+    """
+
+    cwd: Optional[str] = Field(
+        default=None,
+        description="Internal: working directory sent by the MCP client for this request",
+    )
+
+    @field_validator("cwd")
+    @classmethod
+    def _cwd_ok(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        check_path_value(value)
+        if not value:
+            raise ValueError("cwd must not be empty")
+        return value
+
+    model_config = {"populate_by_name": True}
 
 
 # --- version marker (read/write/edit optimistic concurrency) ---------------
@@ -60,7 +107,7 @@ class Version(BaseModel):
 
 # --- read -----------------------------------------------------------------
 
-class ReadInput(BaseModel):
+class ReadInput(PathInput):
     path: str = Field(description="Path of the file or directory to read")
     offset: Optional[int] = Field(
         default=None, ge=1,
@@ -70,6 +117,11 @@ class ReadInput(BaseModel):
         default=None, ge=1, le=MAX_READ_LINES,
         description="The maximum number of directory entries or text lines to read",
     )
+
+    @field_validator("path")
+    @classmethod
+    def _path_ok(cls, value: str) -> str:
+        return check_path_value(value)
 
 
 class FileSystemContent(BaseModel):
@@ -107,7 +159,7 @@ class ListPage(BaseModel):
 
 # --- write ----------------------------------------------------------------
 
-class WriteInput(BaseModel):
+class WriteInput(PathInput):
     path: str = Field(
         description="File path to write. Relative paths resolve within the active "
         "Location; external absolute paths require external_directory approval."
@@ -118,6 +170,11 @@ class WriteInput(BaseModel):
         description="Version returned by the last read of this file. Required "
         "when the file already exists; omit only to create a new file.",
     )
+
+    @field_validator("path")
+    @classmethod
+    def _path_ok(cls, value: str) -> str:
+        return check_path_value(value)
 
     model_config = {"populate_by_name": True}
 
@@ -132,7 +189,7 @@ class WriteOutput(BaseModel):
 
 # --- edit -----------------------------------------------------------------
 
-class EditInput(BaseModel):
+class EditInput(PathInput):
     path: str = Field(description="File path to edit")
     old_string: str = Field(alias="oldString", description="Exact text to replace")
     new_string: str = Field(alias="newString", description="Replacement text")
@@ -144,6 +201,11 @@ class EditInput(BaseModel):
         default=None, alias="expectedVersion",
         description="Version returned by the last read of this file. Required.",
     )
+
+    @field_validator("path")
+    @classmethod
+    def _path_ok(cls, value: str) -> str:
+        return check_path_value(value)
 
     model_config = {"populate_by_name": True}
 
@@ -164,15 +226,20 @@ class EditOutput(BaseModel):
 
 # --- glob / grep ----------------------------------------------------------
 
-class GlobInput(BaseModel):
+class GlobInput(PathInput):
     pattern: str = Field(description="Glob pattern to match files against")
     path: Optional[str] = Field(
         default=None, description="Relative directory to search. Defaults to the active Location."
     )
     limit: Optional[int] = Field(default=None, ge=1, description="Maximum results to return")
 
+    @field_validator("path")
+    @classmethod
+    def _path_ok(cls, value: Optional[str]) -> Optional[str]:
+        return None if value is None else check_path_value(value)
 
-class GrepInput(BaseModel):
+
+class GrepInput(PathInput):
     pattern: str = Field(description="Regex pattern to search for in file contents")
     path: Optional[str] = Field(
         default=None, description="Relative directory to search. Defaults to the active Location."
@@ -182,6 +249,11 @@ class GrepInput(BaseModel):
         description='File glob to include in the search (for example, "*.js" or "*.{ts,tsx}")',
     )
     limit: Optional[int] = Field(default=None, ge=1, description="Maximum matches to return")
+
+    @field_validator("path")
+    @classmethod
+    def _path_ok(cls, value: Optional[str]) -> Optional[str]:
+        return None if value is None else check_path_value(value)
 
 
 class Submatch(BaseModel):

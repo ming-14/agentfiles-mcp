@@ -9,6 +9,7 @@ import httpx
 import pytest
 
 import agentfiles_mcp.server as mcp_server
+from agentfiles_mcp import cwd as cwd_state
 from agentfiles_mcp.client import ToolClient
 from agentfiles_mcp.config import Config as ClientConfig
 from agentfiles_server.app import create_app
@@ -41,6 +42,8 @@ def wired(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(mcp_server, "_client", tool_client)
     monkeypatch.setenv("AF_TEMP_DIR", str(tmp_path / "dl"))
+    # relative paths resolve against the proxy's cwd: set it for these tests
+    monkeypatch.setattr(cwd_state, "_cwd", str(workspace))
     return workspace
 
 

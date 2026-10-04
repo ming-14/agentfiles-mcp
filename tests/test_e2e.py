@@ -30,6 +30,7 @@ def client(tmp_path):
         ServerConfig(workspace=str(workspace), tokens={TOKEN: SECRET})
     )
     with TestClient(app) as test_client:
+        test_client.af_workspace = str(workspace)
         yield test_client
 
 
@@ -104,7 +105,7 @@ def test_tampered_body_rejected(client):
 
 
 def test_replay_rejected(client):
-    body = json.dumps({"path": "x"}).encode()
+    body = json.dumps({"path": "x", "cwd": client.af_workspace}).encode()
     headers = build_headers(
         token=TOKEN, secret=SECRET, method="POST", path="/v1/read", body=body
     ).as_dict()
@@ -121,7 +122,7 @@ def test_replay_rejected(client):
 
 def test_signed_call_reaches_handler(client):
     """A valid signed request passes auth and reaches the tool handler."""
-    resp = signed_post(client, "/v1/read", {"path": "x"})
+    resp = signed_post(client, "/v1/read", {"path": "x", "cwd": client.af_workspace})
     assert resp.status_code == 200  # auth ok, handler reports missing file
     data = resp.json()
     assert data["ok"] is False
@@ -154,7 +155,11 @@ def test_out_of_range_field_is_invalid_input(client):
 
 
 def test_valid_input_reaches_handler(client):
-    resp = raw_post(client, "/v1/read", b'{"path":"a","offset":1,"limit":10}')
+    body = json.dumps(
+        {"path": "a", "offset": 1, "limit": 10, "cwd": client.af_workspace},
+        separators=(",", ":"),
+    ).encode()
+    resp = raw_post(client, "/v1/read", body)
     assert resp.json()["error"]["code"] == "unable_to_read"
 
 
@@ -170,7 +175,7 @@ def test_routes_do_not_depend_on_lifespan(tmp_path):
     lifespan (TestClient without a context manager, ASGITransport) still works."""
     app = create_app(ServerConfig(workspace=str(tmp_path), tokens={TOKEN: SECRET}))
     client = TestClient(app)  # deliberately not used as a context manager
-    resp = signed_post(client, "/v1/read", {"path": "x"})
+    resp = signed_post(client, "/v1/read", {"path": "x", "cwd": str(tmp_path)})
     assert resp.status_code == 200
     assert resp.json()["error"]["code"] == "unable_to_read"
 
@@ -223,7 +228,7 @@ async def test_httpx_client_round_trip(tmp_path):
     tool_client = _asgi_client(app)
 
     with pytest.raises(ToolError) as exc:
-        await tool_client.call("read", {"path": "x"})
+        await tool_client.call("read", {"path": "x", "cwd": str(tmp_path)})
     assert exc.value.code == "unable_to_read"
     await tool_client.aclose()
 
@@ -314,7 +319,9 @@ def test_body_at_the_limit_still_reaches_the_handler(tmp_path):
     client = limited_client(tmp_path, 1024)
     resp = raw_post(client, "/v1/read", body_of_size(1024))
     assert resp.status_code == 200
-    assert resp.json()["error"]["code"] == "unable_to_read"
+    # the exact-size body carries no cwd: reaching this error proves the
+    # handler ran (the body limit check passed) without changing the length
+    assert resp.json()["error"]["code"] == "cwd_not_set"
 
 
 def test_oversized_body_is_refused_before_authentication(tmp_path):

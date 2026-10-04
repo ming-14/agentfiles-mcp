@@ -6,34 +6,52 @@ The path is covered by the HMAC signature (the canonical string includes the
 query string), so a tampered target fails signature verification before the
 handler runs. Note what the signature does *not* do: it is computed by the
 client from the shared secret, so it proves who is asking, never what may be
-served. The authorization boundary is entirely server-side -- containment
-(workspace / whitelist) plus the ``AF_READ_DENY`` policy, both re-checked
-here for every request. The handler then streams raw bytes.
+served. The authorization boundary is entirely server-side -- open-then-
+verify like every other tool: the file is opened, containment + deny are
+checked against THE HANDLE's real path, and the bytes are streamed from that
+same fd, so what is verified is what is served.
+
+Containment failures collapse into the same "no longer available" envelope a
+missing file gets (logged server-side): the model must not learn, through
+this channel, whether a probed path exists outside the workspace.
 """
 
 from __future__ import annotations
 
 import os
-from pathlib import Path
 
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from agentfiles_shared.errors import ToolError, invalid_input, transport_too_large, \
     transport_unavailable, unable_to_read
 from agentfiles_shared.transport import DOWNLOAD_PATH
-from agentfiles_shared.wildcard import match as wildcard_match
 
 from .config import Config
 from .fslayer import Resolver
+from .handlepath import OPEN_RDONLY
 from .readfs import mime_type
+
+_CHUNK = 64 * 1024
 
 
 def _error(exc: ToolError, status: int = 200) -> JSONResponse:
     return JSONResponse(status_code=status, content={"ok": False, "error": exc.to_payload()})
 
 
+def _stream(opened):
+    """Yield the verified handle's bytes, closing it when done or on error."""
+    try:
+        while True:
+            chunk = os.read(opened.fd, _CHUNK)
+            if not chunk:
+                return
+            yield chunk
+    finally:
+        opened.close()
+
+
 def download(resolver: Resolver, config: Config, raw_path: str):
-    """Return a FileResponse for ``raw_path``, or a JSON error envelope.
+    """Stream ``raw_path`` through a verified handle, or a JSON error envelope.
 
     Signature verification (including the signed query string) already happened
     in the middleware; this enforces containment, read-deny policy and size.
@@ -46,30 +64,40 @@ def download(resolver: Resolver, config: Config, raw_path: str):
         return _error(invalid_input("path must be an absolute path"), status=400)
 
     try:
-        target = resolver.resolve(raw_path)
-    except ToolError as exc:
-        # containment failure (symlink/external escape) -> 403
-        return _error(exc, status=403)
-
-    # Same policy as the read tool, matched against the same resource string,
-    # so a denied file cannot be fetched by going around the tool handler.
-    if any(wildcard_match(pattern, target.resource) for pattern in config.read_deny):
-        return _error(unable_to_read(raw_path), status=403)
-
-    canonical = target.canonical
-    if not os.path.isfile(canonical):
+        opened = resolver.open_checked(
+            raw_path,
+            flags=OPEN_RDONLY,
+            expect="file",
+            deny=config.read_deny,
+            on_deny=unable_to_read(raw_path),
+        )
+    except FileNotFoundError:
         return _error(transport_unavailable(raw_path), status=404)
+    except IsADirectoryError:
+        return _error(transport_unavailable(raw_path), status=404)
+    except OSError:
+        return _error(transport_unavailable(raw_path), status=404)
+    except ToolError as exc:
+        if exc.code in ("path_escape", "path_kind"):
+            # logged inside; same envelope as "missing" so the channel cannot
+            # be used to map what lies outside the workspace
+            return _error(transport_unavailable(raw_path), status=404)
+        return _error(exc, status=403)  # deny and other policy errors
 
-    size = os.path.getsize(canonical)
+    size = opened.stat.st_size
     if size > config.transport_max:
-        return _error(transport_too_large(raw_path, size, config.transport_max), status=413)
+        opened.close()
+        return _error(
+            transport_too_large(raw_path, size, config.transport_max), status=413
+        )
 
-    media_type = mime_type(canonical)
-    return FileResponse(
-        canonical,
-        media_type=media_type,
-        filename=Path(canonical).name,
-        content_disposition_type="attachment",
+    return StreamingResponse(
+        _stream(opened),
+        media_type=mime_type(opened.real),
+        headers={
+            "Content-Length": str(size),
+            "Content-Disposition": f'attachment; filename="{os.path.basename(opened.real)}"',
+        },
     )
 
 

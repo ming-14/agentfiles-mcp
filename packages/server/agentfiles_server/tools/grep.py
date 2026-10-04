@@ -1,8 +1,11 @@
-"""grep tool — V2 semantics with containment checks and deny exclusions.
+"""grep tool — verified search root, deny exclusions, V2 rendering.
 
-The search root goes through the resolver (V2 does not check it), a file
-target narrows rg to that single file, and AF_READ_DENY patterns are passed
-as ``--glob=!`` exclusions so denied files never surface in results.
+The root (path / request cwd / workspace) and any single-file target are
+opened and verified through their handles before ripgrep sees them: rg
+follows command-line files even past its ignore rules, so the file it is
+handed must already be containment-checked. Deny patterns also ride along as
+``--glob=!`` exclusions for the walk itself. path_escape collapses into the
+generic message (logged server-side only).
 """
 
 from __future__ import annotations
@@ -15,11 +18,11 @@ from agentfiles_shared.errors import (
     unable_to_grep,
 )
 from agentfiles_shared.schema import GrepInput
-from agentfiles_shared.wildcard import match as wildcard_match
 
 from .. import rg
 from ..config import Config
 from ..fslayer import Resolver, contains, slash
+from ..handlepath import OPEN_RDONLY
 
 
 def execute(
@@ -34,40 +37,55 @@ def execute(
         if exc.code in SEARCH_TRANSPARENT_CODES:
             raise
         raise unable_to_grep(params.pattern) from None
+    except OSError:
+        raise unable_to_grep(params.pattern) from None
 
 
 def _run(
     resolver: Resolver, config: Config, params: GrepInput
 ) -> tuple[dict, str]:
-    target = resolver.resolve(params.path) if params.path else None
-    base = target.canonical if target else resolver.root
-
-    if os.path.isdir(base):
-        cwd, single_file = base, None
+    if params.path:
+        full = resolver.locate(params.path, params.cwd)
     else:
-        cwd, single_file = os.path.dirname(base), os.path.basename(base)
-        # ripgrep bypasses glob exclusions for files named on the command
-        # line, so the deny list must be enforced here, before spawning
-        if any(
-            wildcard_match(pattern, target.resource)
-            for pattern in config.read_deny
-        ):
+        full = params.cwd or resolver.root
+
+    # verify the target through its handle first: deny is matched against the
+    # real resource AND the lexical one (a .env symlinked as good.txt is
+    # denied either way), before rg ever opens the file
+    try:
+        opened = resolver.open_checked(
+            full, flags=OPEN_RDONLY, expect="any",
+            deny=config.read_deny,
+            on_deny=ToolError("grep_deny", ""),
+        )
+    except ToolError as exc:
+        if exc.code == "grep_deny":
+            # a denied target answers exactly like a missing one (no matches):
+            # an error here would tell the model the path exists but is protected
             return {"matches": [], "truncated": False}, "No files found"
+        raise
+    with opened:
+        if opened.is_dir:
+            cwd, single_file = opened.real, None
+        else:
+            # ripgrep bypasses glob exclusions for files named on the command
+            # line, so the verified real path is what rg receives
+            cwd, single_file = os.path.dirname(opened.real), os.path.basename(opened.real)
 
-    limit = params.limit if params.limit is not None else 10_000
-    binary = rg.find_binary(config.ripgrep_path)
-    result = rg.run_grep(
-        binary,
-        cwd=cwd,
-        pattern=params.pattern,
-        file=single_file,
-        include=params.include,
-        limit=limit,
-        deny=config.read_deny,
-        timeout=config.rg_timeout,
-    )
+        limit = params.limit if params.limit is not None else 10_000
+        binary = rg.find_binary(config.ripgrep_path)
+        result = rg.run_grep(
+            binary,
+            cwd=cwd,
+            pattern=params.pattern,
+            file=single_file,
+            include=params.include,
+            limit=limit,
+            deny=config.read_deny,
+            timeout=config.rg_timeout,
+        )
 
-    matches = [_to_match(resolver, cwd, m) for m in result.items]
+        matches = [_to_match(resolver, cwd, m) for m in result.items]
 
     if not matches:
         return {"matches": [], "truncated": result.truncated}, "No files found"

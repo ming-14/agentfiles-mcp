@@ -94,5 +94,19 @@ async def test_download_outside_workspace_is_denied(server, tmp_path, monkeypatc
     tool_client = client_for(server)
     with pytest.raises(ToolError) as exc:
         await tool_client.download(str(tmp_path / "not-here.png"))
-    assert exc.value.code == "path_escape"
+    # unified envelope: outside-containment and missing are indistinguishable
+    assert exc.value.code == "transport_unavailable"
+    await tool_client.aclose()
+
+
+async def test_download_existing_outside_workspace_is_denied(server, tmp_path, monkeypatch):
+    """A file that really exists outside containment reads exactly like one
+    that does not -- the channel cannot map the server's filesystem."""
+    monkeypatch.setenv("AF_TEMP_DIR", str(tmp_path / "dl"))
+    outside = tmp_path / "really-there.png"
+    outside.write_bytes(PNG)
+    tool_client = client_for(server)
+    with pytest.raises(ToolError) as exc:
+        await tool_client.download(str(outside))
+    assert exc.value.code == "transport_unavailable"
     await tool_client.aclose()
