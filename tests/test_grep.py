@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 
 import pytest
@@ -10,6 +11,7 @@ from fastapi.testclient import TestClient
 
 from agentfiles_server.app import create_app
 from agentfiles_server.config import Config
+from agentfiles_server.fslayer import slash
 
 pytestmark = pytest.mark.skipif(
     not shutil.which("rg"), reason="ripgrep (rg) not on PATH"
@@ -77,6 +79,40 @@ def test_grouped_model_text(workspace):
     assert lines[b_at + 1].startswith("  Line ")
     between = lines[min(a_at, b_at):max(a_at, b_at)]
     assert "" in between  # separator between file groups
+
+
+def test_narrow_search_renders_the_real_path(workspace):
+    """Searching a subdirectory must not render the workspace-relative name
+    joined onto the search root (/ws/src + src/a.ts -> /ws/src/src/a.ts)."""
+    with make_client(workspace) as client:
+        data = grep(client, pattern="needle", path="src")
+    assert data["ok"] is True
+    header = next(
+        line for line in data["modelText"].splitlines() if line.endswith("a.ts:")
+    )
+    expected = slash(os.path.realpath(workspace / "src" / "a.ts"))
+    assert header == f"{expected}:"
+
+
+def test_hit_outside_containment_is_dropped(workspace, tmp_path, fake_rg):
+    """A hit that resolves outside the workspace is dropped, not rendered:
+    search must not map what a read of the same path would refuse."""
+    record = json.dumps({
+        "type": "match",
+        "data": {
+            "path": {"text": "../outside/secret.txt"},
+            "lines": {"text": "needle\n"},
+            "line_number": 1,
+            "absolute_offset": 0,
+            "submatches": [],
+        },
+    }).encode("utf-8") + b"\n"
+    fake = fake_rg(tmp_path, record)
+    with make_client(workspace, ripgrep_path=fake) as client:
+        data = grep(client, pattern="needle")
+    assert data["ok"] is True
+    assert data["result"]["matches"] == []
+    assert data["modelText"] == "No files found"
 
 
 def test_no_match_renders_no_files_found(workspace):

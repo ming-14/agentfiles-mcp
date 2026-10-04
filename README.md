@@ -65,23 +65,28 @@ Headers:
 错误归并防文件系统测绘——「workspace 外存在」「不存在」「被 deny」三种情况对模型
 呈现**同一条** `Unable to read <path>`（原因只进服务端日志）。
 
-**cwd 与 workspace 是两个概念**：
-- **workspace** = 服务端配置的 `AF_WORKSPACE`，固定不变，安全边界
-- **cwd** = MCP 客户端**每请求**携带的字段（不是进程状态——服务端并发，绝不能
-  `chdir`），相对路径以它为基准。它被校验但**不被信任**：最终打开的文件自己会
-  被句柄验证，cwd 只影响「定位」。glob/grep 不传 `path` 时搜索根也取 cwd，
+**cwd 与 workspace 是两个概念，而且只有后者是服务端内部的东西**：
+
+- **workspace** = 服务端配置的 `AF_WORKSPACE`，固定不变，安全边界。它只在服务端
+  内部起作用：containment 判定、以及解析 `set_cwd` 收到的相对输入。**不向客户端
+  暴露**，也没有任何端点能取到它
+- **cwd** = 客户端用 `POST /v1/cwd` 申请、服务端验证通过后返回的目录，由客户端
+  自己保存并**每请求**附上（它不是服务端进程状态——服务端并发，绝不能 `chdir`），
+  相对路径以它为基准。它被校验但**不被信任**：最终打开的文件自己会被句柄验证，
+  cwd 只影响「定位」。glob/grep 不传 `path` 时搜索根也取 cwd，
   未设则回落到 workspace；`cwd` 不是绝对路径一律 `invalid_input`，绝不会退化成
   进程自己的 cwd
 
 MCP 侧流程：启动时 cwd 为空 → 相对路径请求被 `cwd_not_set` 拦截（不落任何默认
 基准）→ 模型调用 `set_cwd` → 客户端问服务端 `POST /v1/cwd`（打开目录句柄验证，
 返回内核真身路径）→ 客户端存下规范形 → 后续请求原样附上。`workspace` 工具可
-随时查看服务端根目录。
+随时查看这个 cwd。
 
 **目录列表与 ripgrep 是唯一的句柄级残留窗口**：Windows 无 fd 列目录（`os.listdir`
 不接受 int），列表用已验证的真身路径走一次；rg 收到的也是已验证的真身路径，
-但其内部遍历与后续打开不经我们句柄。两者内容级防线是：目录列表逐项
-`realpath + contains` 过滤、rg 默认不跟随符号链接——**文件内容的读与写则全部
+但其内部遍历与后续打开不经我们句柄。两者内容级防线一致：报出的每个名字都
+`realpath` 后再判 containment，落在 workspace 与白名单之外的**直接丢弃**（与读
+同一路径得到的答复一致），rg 默认也不跟随符号链接——**文件内容的读与写则全部
 经句柄，零窗口**。
 
 ### 文件传输（transport）
@@ -220,7 +225,6 @@ python -m agentfiles_server
 
 ```
 GET  /healthz                        探活（免签名）
-GET  /v1/workspace                   服务端根目录（签名）
 POST /v1/cwd          {path}         校验并返回 cwd 规范形（签名）
 POST /v1/read    {path, cwd?, offset?, limit?}
 POST /v1/write   {path, cwd?, content, expectedVersion?}
@@ -299,9 +303,12 @@ GET  /v1/transport/download?path=<abs>   拉取文件字节（query 参与签名
 }
 ```
 
-暴露的 MCP 工具：`read`、`write`、`edit`、`glob`、`grep`，外加两个 cwd 工具：
+暴露 7 个 MCP 工具。五个文件工具带 `remote_` 前缀——它们操作的是**服务端**的
+文件系统，加前缀是为了不与宿主自带的同名本地文件工具撞名：
+`remote_read`、`remote_write`、`remote_edit`、`remote_glob`、`remote_grep`。
+另外两个是这套服务自身的概念，不带前缀：
 
-- **`workspace`** — 查看服务端 workspace 根目录与当前 cwd
+- **`workspace`** — 显示本客户端当前的 cwd（就是 `set_cwd` 设下的那个）
 - **`set_cwd(path)`** — 让服务端验证目录（打开句柄确认存在、是目录、在
   containment 内），存下返回的规范形；成功后相对路径才可用。**失败不改变当前
   cwd**，且 missing / 非目录 / 越界三种失败同一文案（`invalid_cwd`），模型无法

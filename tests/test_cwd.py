@@ -4,7 +4,7 @@ Covers the agreed design:
   * workspace = server-configured root; cwd = per-request field from the client
   * relative path without cwd -> cwd_not_set (intercepted, not defaulted)
   * POST /v1/cwd validates through a handle; one message for all failures
-  * MCP tools: workspace (fetch root) and set_cwd (validate + store)
+  * MCP tools: workspace (own cwd only) and set_cwd (validate + store)
   * receipts are keyed by (cwd, path): a cwd switch must not reuse them
   * probing cannot map the server: existing-outside == missing == denied
 """
@@ -38,13 +38,6 @@ def signed_post(client: TestClient, path: str, payload: dict):
     ).as_dict()
     headers["Content-Type"] = "application/json"
     return client.post(path, content=body, headers=headers)
-
-
-def signed_get(client: TestClient, path: str, query: str = ""):
-    headers = build_headers(
-        token=TOKEN, secret=SECRET, method="GET", path=path, body=b"", query=query
-    ).as_dict()
-    return client.get(f"{path}?{query}" if query else path, headers=headers)
 
 
 @pytest.fixture()
@@ -147,18 +140,9 @@ def test_set_cwd_requires_signature(client):
     assert resp.status_code == 401
 
 
-# --- GET /v1/workspace ----------------------------------------------------------
-
-def test_workspace_endpoint(client):
-    data = signed_get(client, "/v1/workspace").json()
-    assert data["ok"] is True
-    assert os.path.normcase(data["workspace"]) == os.path.normcase(
-        os.path.realpath(client.af_workspace)
-    )
-
-
-def test_workspace_requires_signature(client):
-    assert client.get("/v1/workspace").status_code == 401
+def test_no_route_serves_the_workspace_root(client):
+    """The workspace root is server configuration; no endpoint hands it out."""
+    assert "/v1/workspace" not in {route.path for route in client.app.routes}
 
 
 # --- probing cannot map the filesystem -----------------------------------------
@@ -222,16 +206,19 @@ def _wire(tmp_path, monkeypatch):
     return workspace
 
 
-async def test_mcp_workspace_and_set_cwd_tools(tmp_path, monkeypatch):
+async def test_mcp_workspace_reports_own_cwd(tmp_path, monkeypatch):
+    """workspace reports this client's own cwd; the server's workspace root is
+    never fetched and never appears in the output."""
     workspace = _wire(tmp_path, monkeypatch)
     try:
-        text = await mcp_server.workspace()
-        assert "Server workspace:" in text
-        assert "not set" in text  # starts unset
+        assert "not set" in await mcp_server.workspace()
 
-        text = await mcp_server.set_cwd("sub")
-        assert text == f"Working directory set to {os.path.realpath(workspace / 'sub')}"
-        assert cwd_state.get() is not None
+        assert await mcp_server.set_cwd("sub") == (
+            f"Working directory set to {os.path.realpath(workspace / 'sub')}"
+        )
+        cwd = cwd_state.get()
+        assert cwd is not None
+        assert await mcp_server.workspace() == f"Working directory: {cwd}"
     finally:
         cwd_state.clear()
 

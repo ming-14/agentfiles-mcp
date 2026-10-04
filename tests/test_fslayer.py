@@ -37,6 +37,30 @@ def open_ok(resolver: Resolver, path: str, **kw):
     return opened
 
 
+# --- resolve_child: a name a search reported, resolved then containment-checked
+
+
+def test_resolve_child_inside_is_workspace_relative(workspace: Path):
+    resolver = Resolver(str(workspace))
+    resource, real = resolver.resolve_child(resolver.root, "src/main.ts")
+    assert resource == "src/main.ts"
+    assert real == os.path.realpath(str(workspace / "src" / "main.ts"))
+
+
+def test_resolve_child_outside_is_dropped(workspace: Path):
+    """A hit resolving outside every root is dropped: search must not report
+    -- and so must not map -- what a read of the same path would refuse."""
+    resolver = Resolver(str(workspace))
+    assert resolver.resolve_child(resolver.root, "../outside.txt") is None
+
+
+def test_resolve_child_whitelisted_stays_absolute(workspace: Path, tmp_path: Path):
+    resolver = Resolver(str(workspace), whitelist=[str(tmp_path)])
+    resource, real = resolver.resolve_child(resolver.root, "../outside.txt")
+    assert os.path.isabs(resource)
+    assert resource == slash(real)
+
+
 # --- locate: poison + cwd joining, no authorization --------------------------
 
 def test_locate_absolute_is_normpath(workspace: Path):

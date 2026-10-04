@@ -14,12 +14,14 @@ from agentfiles_shared.schema import (
     WriteInput,
 )
 
+# keyed by the exposed MCP name (remote_ prefix) -- what the model calls; the
+# route name sent to the server has no prefix
 MODELS = {
-    "read": ReadInput,
-    "write": WriteInput,
-    "edit": EditInput,
-    "glob": GlobInput,
-    "grep": GrepInput,
+    "remote_read": ReadInput,
+    "remote_write": WriteInput,
+    "remote_edit": EditInput,
+    "remote_glob": GlobInput,
+    "remote_grep": GrepInput,
 }
 
 # tools whose parameters are not schema-sourced (plain strings / no input)
@@ -73,7 +75,8 @@ async def test_edit_payload_uses_wire_aliases(monkeypatch):
     client = RecordingClient()
     monkeypatch.setattr(server, "_client", client)
     await server.mcp.call_tool(
-        "edit", {"path": "a", "oldString": "x", "newString": "y", "replaceAll": True}
+        "remote_edit",
+        {"path": "a", "oldString": "x", "newString": "y", "replaceAll": True},
     )
     assert client.tool == "edit"
     assert client.payload == {
@@ -87,7 +90,7 @@ async def test_edit_payload_uses_wire_aliases(monkeypatch):
 async def test_optional_nulls_are_omitted_from_payload(monkeypatch):
     client = RecordingClient()
     monkeypatch.setattr(server, "_client", client)
-    await server.mcp.call_tool("glob", {"pattern": "*"})
+    await server.mcp.call_tool("remote_glob", {"pattern": "*"})
     assert client.payload == {"pattern": "*"}
 
 
@@ -97,7 +100,7 @@ async def test_tool_error_code_survives_fastmcp(monkeypatch):
         server, "_client", RecordingClient(error=ToolError("unauthorized", "nope"))
     )
     with pytest.raises(Exception) as exc:
-        await server.mcp.call_tool("read", {"path": "x"})
+        await server.mcp.call_tool("remote_read", {"path": "x"})
     assert "[unauthorized] nope" in str(exc.value)
 
 

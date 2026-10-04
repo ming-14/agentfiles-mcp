@@ -6,6 +6,9 @@ follows command-line files even past its ignore rules, so the file it is
 handed must already be containment-checked. Deny patterns also ride along as
 ``--glob=!`` exclusions for the walk itself. path_escape collapses into the
 generic message (logged server-side only).
+
+Names rg reports go through ``Resolver.resolve_child``: hits landing outside
+containment are dropped, not rendered.
 """
 
 from __future__ import annotations
@@ -21,7 +24,7 @@ from agentfiles_shared.schema import GrepInput
 
 from .. import rg
 from ..config import Config
-from ..fslayer import Resolver, contains, slash
+from ..fslayer import Resolver, slash
 from ..handlepath import OPEN_RDONLY
 
 
@@ -85,47 +88,50 @@ def _run(
             timeout=config.rg_timeout,
         )
 
-        matches = [_to_match(resolver, cwd, m) for m in result.items]
+        hits = []
+        for raw in result.items:
+            hit = _to_match(resolver, cwd, raw)
+            if hit is None:
+                continue
+            hits.append(hit)
+        matches = [match for match, _ in hits]
 
     if not matches:
         return {"matches": [], "truncated": result.truncated}, "No files found"
 
-    # grouped rendering: absolute path header, then "  Line N: text".
+    # grouped rendering: header, then "  Line N: text". The header is the
+    # resolved real path; joining it back onto the search root doubles the base.
     # rg's `lines.text` keeps its trailing newline (V2's Match.text does too);
     # it is stripped here so the rendered block has no stray blank lines.
     lines = [f"Found {len(matches)} matches"]
     current = None
-    for match in matches:
+    for match, absolute in hits:
         if current != match["entry"]["path"]:
             if current is not None:
                 lines.append("")
             current = match["entry"]["path"]
-            lines.append(f"{_absolute(cwd, current)}:")
+            lines.append(f"{slash(absolute)}:")
         preview = match["text"].rstrip("\r\n")
         lines.append(f"  Line {match['line']}: {preview}")
     return {"matches": matches, "truncated": result.truncated}, "\n".join(lines)
 
 
-def _to_match(resolver: Resolver, cwd: str, raw: rg.RawMatch) -> dict:
-    absolute = os.path.normpath(os.path.join(cwd, raw.path))
-    if contains(resolver.root, absolute):
-        rel = os.path.relpath(absolute, resolver.root)
-        resource = "." if rel == "." else slash(rel)
-    else:
-        resource = slash(absolute)
+def _to_match(
+    resolver: Resolver, cwd: str, raw: rg.RawMatch
+) -> tuple[dict, str] | None:
+    """One rg hit as (match, real path); None when it resolves outside
+    containment."""
+    hit = resolver.resolve_child(cwd, raw.path)
+    if hit is None:
+        return None
+    resource, absolute = hit
     return {
         "entry": {"path": resource, "type": "file"},
         "line": raw.line,
         "offset": raw.offset,
         "text": raw.text,
         "submatches": raw.submatches,
-    }
-
-
-def _absolute(cwd: str, resource: str) -> str:
-    if resource.startswith("/") or (len(resource) >= 3 and resource[1] == ":"):
-        return resource
-    return slash(os.path.join(cwd, resource))
+    }, absolute
 
 
 __all__ = ["execute"]

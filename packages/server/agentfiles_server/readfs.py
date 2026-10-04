@@ -110,7 +110,9 @@ def mime_type(path: str) -> str:
 
 
 def _file_uri(path: str) -> str:
-    return Path(path).resolve().as_uri()
+    # path is the handle's real path already; resolve() would walk links a
+    # second time and could land on something else than what was verified
+    return Path(path).as_uri()
 
 
 # --- sniffing ---------------------------------------------------------------

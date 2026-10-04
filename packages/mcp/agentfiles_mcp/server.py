@@ -1,5 +1,11 @@
 """FastMCP server exposing the five V2 file tools over stdio.
 
+Exposed names carry a ``remote_`` prefix (``remote_read``, ...) so the file
+tools do not collide with same-named local tools the host may already offer;
+``workspace`` and ``set_cwd`` stay unprefixed, being this server's own
+concepts. The ``tool`` string passed to :func:`_call` is the server route
+(``/v1/read``, ...) and never carries the prefix.
+
 Parameter descriptions and constraints are not repeated here: every tool
 parameter borrows the ``FieldInfo`` from ``agentfiles_shared.schema``, which is
 the single source of truth for both the REST and the MCP input schemas.
@@ -130,7 +136,7 @@ _GREP = GrepInput.model_fields
 
 
 @mcp.tool()
-async def read(
+async def remote_read(
     path: Annotated[str, _READ["path"]],
     offset: Annotated[int | None, _READ["offset"]] = None,
     limit: Annotated[int | None, _READ["limit"]] = None,
@@ -142,7 +148,7 @@ async def read(
 
 
 @mcp.tool()
-async def write(
+async def remote_write(
     path: Annotated[str, _WRITE["path"]],
     content: Annotated[str, _WRITE["content"]],
 ) -> str:
@@ -151,7 +157,7 @@ async def write(
 
 
 @mcp.tool()
-async def edit(
+async def remote_edit(
     path: Annotated[str, _EDIT["path"]],
     oldString: Annotated[str, _EDIT["old_string"]],
     newString: Annotated[str, _EDIT["new_string"]],
@@ -165,7 +171,7 @@ async def edit(
 
 
 @mcp.tool()
-async def glob(
+async def remote_glob(
     pattern: Annotated[str, _GLOB["pattern"]],
     path: Annotated[str | None, _GLOB["path"]] = None,
     limit: Annotated[int | None, _GLOB["limit"]] = None,
@@ -176,7 +182,7 @@ async def glob(
 
 
 @mcp.tool()
-async def grep(
+async def remote_grep(
     pattern: Annotated[str, _GREP["pattern"]],
     path: Annotated[str | None, _GREP["path"]] = None,
     include: Annotated[str | None, _GREP["include"]] = None,
@@ -191,25 +197,14 @@ async def grep(
 
 @mcp.tool()
 async def workspace() -> str:
-    """Show the server's workspace root.
+    """Show this client's working directory: the base relative paths resolve
+    against, set by set_cwd.
 
-    The absolute directory that relative paths anchor to on the server. Note
-    the server's paths are its own namespace: they are what file tools expect,
-    not paths on your local machine.
+    Paths here are the server's namespace, not directories on your local
+    machine. The server's own workspace root -- what it resolves containment
+    against -- is not reported here.
     """
-    try:
-        root = await client().workspace()
-    except RemoteError as exc:
-        raise ToolError("remote_unavailable", str(exc.detail)) from exc
-    except ToolError as exc:
-        raise ToolError(exc.code, f"[{exc.code}] {exc.message}") from exc
-    current = cwd_state.get()
-    if current:
-        return f"Server workspace: {root}\nWorking directory: {current}"
-    return (
-        f"Server workspace: {root}\n"
-        "Working directory: not set (relative paths are rejected until set_cwd is used)"
-    )
+    return cwd_state.describe()
 
 
 @mcp.tool()

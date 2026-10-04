@@ -146,6 +146,17 @@ class Resolver:
             return slash(real)
         return None
 
+    def resolve_child(self, base: str, relative: str) -> tuple[str, str] | None:
+        """Resolve a name reported under an already-verified directory.
+
+        Search hits come back as strings, so they get realpath + containment
+        rather than a handle. ``None`` means outside every root: callers drop
+        the hit, so a search cannot map what a read of it would refuse.
+        """
+        real = os.path.realpath(os.path.join(base, relative))
+        resource = self.resource_for(real)
+        return None if resource is None else (resource, real)
+
     # --- stage 3-4: open, then verify THE HANDLE -----------------------------
 
     def open_checked(

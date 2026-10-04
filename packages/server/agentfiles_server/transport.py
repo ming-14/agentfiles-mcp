@@ -19,6 +19,7 @@ this channel, whether a probed path exists outside the workspace.
 from __future__ import annotations
 
 import os
+import re
 
 from fastapi.responses import JSONResponse, StreamingResponse
 
@@ -32,6 +33,14 @@ from .handlepath import OPEN_RDONLY
 from .readfs import mime_type
 
 _CHUNK = 64 * 1024
+
+# A filename may hold anything the filesystem allows -- a quote closes the
+# header value early, CRLF starts a new one. Only printable ASCII survives.
+_HEADER_UNSAFE = re.compile(r"[^\x20-\x7e]|[\\\"]")
+
+
+def _content_disposition(name: str) -> str:
+    return f'attachment; filename="{_HEADER_UNSAFE.sub("_", name).strip() or "file"}"'
 
 
 def _error(exc: ToolError, status: int = 200) -> JSONResponse:
@@ -96,7 +105,7 @@ def download(resolver: Resolver, config: Config, raw_path: str):
         media_type=mime_type(opened.real),
         headers={
             "Content-Length": str(size),
-            "Content-Disposition": f'attachment; filename="{os.path.basename(opened.real)}"',
+            "Content-Disposition": _content_disposition(os.path.basename(opened.real)),
         },
     )
 

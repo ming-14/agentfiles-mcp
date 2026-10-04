@@ -81,31 +81,6 @@ class ToolClient:
             raise _tool_error(error, f"download returned HTTP {response.status_code}")
         return response.content
 
-    async def workspace(self) -> str:
-        """Signed GET /v1/workspace: the server's configured workspace root."""
-        headers = build_headers(
-            token=self._config.token,
-            secret=self._config.secret,
-            method="GET",
-            path="/v1/workspace",
-            body=b"",
-        ).as_dict()
-        try:
-            response = await self._http.get("/v1/workspace", headers=headers)
-        except httpx.HTTPError as exc:
-            raise RemoteError(f"workspace failed: {exc.__class__.__name__}") from exc
-
-        if response.status_code != 200:
-            error = _error_payload(response)
-            if error is None:
-                raise RemoteError(f"/v1/workspace returned HTTP {response.status_code}")
-            raise _tool_error(error, f"/v1/workspace returned HTTP {response.status_code}")
-
-        data = response.json()
-        if not isinstance(data, dict) or not data.get("ok"):
-            raise RemoteError("/v1/workspace returned an unexpected body")
-        return str(data.get("workspace") or "")
-
     async def set_cwd(self, path: str) -> str:
         """POST /v1/cwd: ask the server to validate a working directory.
 

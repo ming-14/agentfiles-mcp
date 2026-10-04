@@ -117,13 +117,6 @@ def create_app(config: Config) -> FastAPI:
         # FileResponse preparation is sync file IO, so keep it off the loop.
         return await run_in_threadpool(download, resolver, config, path)
 
-    @app.get("/v1/workspace")
-    async def workspace() -> JSONResponse:
-        """The configured workspace root (kernel-resolved). Lets the model see
-        where relative paths anchor; read-only, contains nothing sensitive
-        beyond the root the caller is already authorized against."""
-        return JSONResponse(content={"ok": True, "workspace": resolver.root})
-
     @app.post("/v1/cwd")
     async def set_cwd(request: Request) -> JSONResponse:
         """Validate a working directory through a handle and return its

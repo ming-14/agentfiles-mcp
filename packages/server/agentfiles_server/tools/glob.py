@@ -5,11 +5,12 @@ opened and verified through its handle before ripgrep sees it; rg then walks
 the verified real path. Deny patterns ride along as ``--glob=!`` exclusions.
 path_escape collapses into the generic message (V2 behavior) and is only
 logged server-side, so probing cannot map the server's filesystem.
+
+Names rg reports go through ``Resolver.resolve_child``: hits landing outside
+containment are dropped, not rendered.
 """
 
 from __future__ import annotations
-
-import os
 
 from agentfiles_shared.errors import (
     SEARCH_TRANSPARENT_CODES,
@@ -20,7 +21,7 @@ from agentfiles_shared.schema import GlobInput
 
 from .. import rg
 from ..config import Config
-from ..fslayer import Resolver, contains, slash
+from ..fslayer import Resolver, slash
 from ..handlepath import OPEN_RDONLY
 
 
@@ -77,12 +78,10 @@ def _run(
         entries = []
         model_lines = []
         for item in result.items:
-            absolute = os.path.normpath(os.path.join(cwd, item))
-            if contains(resolver.root, absolute):
-                rel = os.path.relpath(absolute, resolver.root)
-                resource = "." if rel == "." else slash(rel)
-            else:
-                resource = slash(absolute)
+            hit = resolver.resolve_child(cwd, item)
+            if hit is None:
+                continue
+            resource, absolute = hit
             entries.append({"path": resource, "type": "file"})
             # model text shows absolute paths (V2 resolves before rendering)
             model_lines.append(slash(absolute))

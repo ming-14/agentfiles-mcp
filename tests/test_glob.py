@@ -170,3 +170,14 @@ def test_whitelisted_external_search(tmp_path):
     entries = [e["path"] for e in data["result"]["entries"]]
     # external results are reported absolute (workspace-relative would escape)
     assert any(e.replace("\\", "/").endswith("docs/guide.md") for e in entries)
+
+
+def test_hit_outside_containment_is_dropped(workspace, tmp_path, fake_rg):
+    """A name rg reports that resolves outside the workspace is dropped rather
+    than rendered under its absolute path -- search must not map the outside."""
+    fake = fake_rg(tmp_path, b"../outside/leak.txt\n")
+    with make_client(workspace, ripgrep_path=fake) as client:
+        data = glob(client, pattern="**/*")
+    assert data["ok"] is True
+    assert data["result"]["entries"] == []
+    assert data["modelText"] == "No files found"

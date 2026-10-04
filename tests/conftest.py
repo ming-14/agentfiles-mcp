@@ -62,3 +62,25 @@ def link_dir():
                 os.unlink(link)
         except OSError:
             pass
+
+
+@pytest.fixture()
+def fake_rg():
+    """Point ``ripgrep_path`` at a script that emits ``payload`` verbatim.
+
+    A real rg walk never produces a name that escapes the root it was given,
+    so the step that resolves reported names has to be fed its own input.
+    """
+    def _script(directory: Path, payload: bytes) -> str:
+        source = directory / "payload.bin"
+        source.write_bytes(payload)
+        if os.name == "nt":
+            script = directory / "fake_rg.bat"
+            script.write_text(f'@echo off\r\ntype "{source}"\r\n', encoding="ascii")
+        else:
+            script = directory / "fake_rg.sh"
+            script.write_text(f'#!/bin/sh\ncat "{source}"\n', encoding="ascii")
+            script.chmod(0o755)
+        return str(script)
+
+    return _script

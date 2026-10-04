@@ -27,3 +27,6 @@ Thumbs.db
 .env.*
 *.pem
 *.key
+
+# WorkBuddy 工作区数据（记忆等，不进版本库）
+.workbuddy-ai/

@@ -442,6 +442,17 @@ def test_download_requires_absolute_path(client, workspace):
     assert resp.json()["error"]["code"] == "invalid_input"
 
 
+def test_content_disposition_cannot_break_the_header():
+    """A filename is whatever the filesystem allows: a quote would close the
+    header value early and CRLF would start a new one."""
+    from agentfiles_server.transport import _content_disposition
+
+    assert _content_disposition('rep"ort') == 'attachment; filename="rep_ort"'
+    # CRLF collapses to a single line; ":" and space are printable, so they stay
+    assert _content_disposition("a\r\nX-Evil: 1") == 'attachment; filename="a__X-Evil: 1"'
+    assert _content_disposition("") == 'attachment; filename="file"'
+
+
 def test_download_whitelisted_external_allowed(tmp_path):
     """Containment goes through Resolver: whitelisted external files stay
     downloadable, everything else is not."""
