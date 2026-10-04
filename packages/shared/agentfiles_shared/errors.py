@@ -150,6 +150,13 @@ def unable_to_grep(pattern: str) -> ToolError:
     return ToolError("unable_to_grep", f"Unable to grep for {pattern}")
 
 
+# Codes glob and grep pass through to the model verbatim; any other failure
+# collapses into the generic "Unable to ..." text above.
+SEARCH_TRANSPARENT_CODES = frozenset(
+    {"path_escape", "rg_unavailable", "rg_timeout", "rg_failed"}
+)
+
+
 # --- request envelope -----------------------------------------------------
 
 def payload_too_large(size: int, limit: int) -> ToolError:

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import os
 import shutil
+import subprocess
+import time
 
 import pytest
 
@@ -174,6 +176,93 @@ def test_grep_long_line_is_bounded(binary, tree):
 
 # --- process / discovery -----------------------------------------------------
 
+def _fake_rg(
+    directory, payload: bytes, sleep: float = 0, to_stderr: bool = False
+) -> str:
+    """A stand-in for rg: writes ``payload``, then idles ``sleep`` seconds.
+
+    A real rg always finishes, so the cases the deadline has to survive - a run
+    that neither writes nor exits, or one that floods stderr - can only be
+    reproduced with a fake.
+    """
+    seconds = max(1, int(sleep))
+    source = directory / "payload.bin"
+    source.write_bytes(payload)
+    if os.name == "nt":
+        lines = ["@echo off", f'type "{source}"' + (" 1>&2" if to_stderr else "")]
+        if sleep > 0:
+            lines.append(f"ping -n {seconds + 1} 127.0.0.1 > nul")
+        script = directory / "fake_rg.bat"
+        script.write_text("\r\n".join(lines) + "\r\n", encoding="ascii")
+    else:
+        lines = ["#!/bin/sh", f'cat "{source}"' + (" >&2" if to_stderr else "")]
+        if sleep > 0:
+            lines.append(f"sleep {seconds}")
+        script = directory / "fake_rg.sh"
+        script.write_text("\n".join(lines) + "\n", encoding="ascii")
+        script.chmod(0o755)
+    return str(script)
+
+
+def test_timeout_bounds_the_read_loop(tmp_path):
+    """A silent, late-exiting rg must not outlive AF_RG_TIMEOUT: iterating
+    stdout has no deadline of its own."""
+    fake = _fake_rg(tmp_path, b"", sleep=5)
+    start = time.monotonic()
+    with pytest.raises(ToolError) as exc:
+        rg.run_glob(
+            fake, cwd=str(tmp_path), pattern="**/*", limit=10,
+            deny=[], timeout=0.5,
+        )
+    assert exc.value.code == "rg_timeout"
+    assert time.monotonic() - start < 4.0
+
+
+def test_noisy_stderr_does_not_deadlock(tmp_path):
+    """rg blocks once the stderr pipe fills: draining has to continue past the
+    8KB cap, or a chatty run never closes stdout and never exits."""
+    fake = _fake_rg(tmp_path, b"rg: warning\n" * 20_000, to_stderr=True)
+    result = rg.run_glob(
+        fake, cwd=str(tmp_path), pattern="**/*", limit=10, deny=[], timeout=10,
+    )
+    assert result.items == []
+
+
+def test_parse_failure_kills_the_child(monkeypatch, tmp_path):
+    """A record rg cannot parse used to leave the process running unreaped."""
+    fake = _fake_rg(tmp_path, b"x" * (rg.MAX_RECORD_BYTES + 1) + b"\n", sleep=5)
+    spawned = []
+    real_popen = subprocess.Popen
+
+    def spy(args, **kwargs):
+        handle = real_popen(args, **kwargs)
+        spawned.append(handle)
+        return handle
+
+    monkeypatch.setattr(rg.subprocess, "Popen", spy)
+    with pytest.raises(ToolError) as exc:
+        rg.run_grep(
+            fake, cwd=str(tmp_path), pattern="needle", file=None, include=None,
+            limit=10, deny=[], timeout=10,
+        )
+    assert exc.value.code == "rg_failed"
+    assert spawned and spawned[0].poll() is not None
+
+
+def test_truncated_ignores_a_signal_exit_code(binary, tree, monkeypatch):
+    """Closing stdout early can end rg with a signal (-13 SIGPIPE on POSIX)
+    instead of 0/1/2; the rows already collected are still good."""
+
+    def wait_then_signal(self, timeout):
+        self.handle.wait(timeout=timeout)
+        return -13
+
+    monkeypatch.setattr(rg._Process, "wait", wait_then_signal)
+    result = run_glob(binary, tree, "**/*", limit=1)
+    assert len(result.items) == 1
+    assert result.truncated is True
+
+
 def test_timeout_is_tool_error(binary, tree):
     with pytest.raises(ToolError) as exc:
         rg.run_glob(
@@ -181,6 +270,34 @@ def test_timeout_is_tool_error(binary, tree):
             deny=[], timeout=0.0,
         )
     assert exc.value.code == "rg_timeout"
+
+
+def test_validate_deny_globs_accepts_a_normal_pattern(binary):
+    assert rg.validate_deny_globs(binary, ["*.env", "*.env.*"]) is None
+
+
+def test_validate_deny_globs_flags_a_broken_pattern(binary):
+    """An unparsable deny glob makes rg exit 2: every search comes back empty
+    with no other symptom, so startup needs to be able to spot it."""
+    complaint = rg.validate_deny_globs(binary, ["**/{a"])
+    assert complaint and "glob" in complaint
+
+
+def test_startup_warns_about_a_broken_deny_glob(binary, tmp_path, capsys):
+    from agentfiles_server.__main__ import _warn_on_broken_deny_globs
+    from agentfiles_server.config import Config
+
+    def warn(patterns):
+        _warn_on_broken_deny_globs(
+            Config(
+                workspace=str(tmp_path), tokens={"t": "s"},
+                read_deny=patterns, ripgrep_path=binary,
+            )
+        )
+        return capsys.readouterr().err
+
+    assert warn(["*.env"]) == ""
+    assert "AF_READ_DENY" in warn(["**/{a"])
 
 
 def test_find_binary_prefers_config(tmp_path):

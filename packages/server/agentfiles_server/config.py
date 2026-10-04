@@ -16,13 +16,15 @@ AF_TRANSPORT_MAX        max bytes for a single file transport, default 100MB
 AF_BODY_MAX             max bytes for a single request body, default 8MB
                         (a larger body is refused before it is buffered)
 AF_RIPGREP_PATH         path to the rg binary (default: search PATH)
-AF_RG_TIMEOUT           seconds a single ripgrep run may take, default 30
+AF_RG_TIMEOUT           seconds a single ripgrep run may take end to end
+                        (reading its output and waiting for it to exit), default 30
 """
 
 from __future__ import annotations
 
 import json
 import os
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from agentfiles_shared.auth import DEFAULT_MAX_SKEW
@@ -32,10 +34,22 @@ DEFAULT_READ_DENY = ["*.env", "*.env.*"]
 # A tool call carries JSON arguments, not file contents: write is the only
 # body that can be big, and anything a model can produce fits in here.
 DEFAULT_BODY_MAX_BYTES = 8 * 1024 * 1024
+DEFAULT_RG_TIMEOUT = 30.0
 
 
 class ConfigError(Exception):
     pass
+
+
+def _number(name: str, default: str, cast: Callable[[str], float]) -> float:
+    raw = os.environ.get(name, "").strip() or default
+    try:
+        value = cast(raw)
+    except ValueError as exc:
+        raise ConfigError(f"{name} must be a number, got {raw!r}") from exc
+    if value <= 0:
+        raise ConfigError(f"{name} must be greater than 0")
+    return value
 
 
 def _json_list(name: str, default: list[str]) -> list[str]:
@@ -65,7 +79,7 @@ class Config:
     transport_max: int = DEFAULT_TRANSPORT_MAX_BYTES
     max_body_bytes: int = DEFAULT_BODY_MAX_BYTES
     ripgrep_path: str | None = None
-    rg_timeout: float = 30.0
+    rg_timeout: float = DEFAULT_RG_TIMEOUT
 
     @property
     def tls_enabled(self) -> bool:
@@ -96,18 +110,18 @@ def load() -> Config:
         addr=os.environ.get("AF_ADDR", "127.0.0.1:8443"),
         tls_cert=os.environ.get("AF_TLS_CERT") or None,
         tls_key=os.environ.get("AF_TLS_KEY") or None,
-        max_skew=int(os.environ.get("AF_MAX_SKEW", DEFAULT_MAX_SKEW)),
+        max_skew=int(_number("AF_MAX_SKEW", str(DEFAULT_MAX_SKEW), int)),
         external_whitelist=[
             os.path.abspath(p) for p in _json_list("AF_EXTERNAL_WHITELIST", [])
         ],
         read_deny=_json_list("AF_READ_DENY", DEFAULT_READ_DENY),
         write_deny=_json_list("AF_WRITE_DENY", DEFAULT_READ_DENY),
         transport_max=int(
-            os.environ.get("AF_TRANSPORT_MAX", str(DEFAULT_TRANSPORT_MAX_BYTES))
+            _number("AF_TRANSPORT_MAX", str(DEFAULT_TRANSPORT_MAX_BYTES), int)
         ),
         max_body_bytes=int(
-            os.environ.get("AF_BODY_MAX", str(DEFAULT_BODY_MAX_BYTES))
+            _number("AF_BODY_MAX", str(DEFAULT_BODY_MAX_BYTES), int)
         ),
         ripgrep_path=os.environ.get("AF_RIPGREP_PATH") or None,
-        rg_timeout=float(os.environ.get("AF_RG_TIMEOUT", "30")),
+        rg_timeout=_number("AF_RG_TIMEOUT", str(DEFAULT_RG_TIMEOUT), float),
     )

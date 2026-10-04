@@ -117,6 +117,11 @@ write 的特例：文件不存在且无回执 → 直接创建（`O_EXCL`，父�
 - `grep`：`--no-config --json --hidden --no-messages [--glob=<include>] ... -- <pattern> <path>`
 - 退出码 `1` → 无结果；`2` + 正则错误 → 归并成 `Unable to grep for <pattern>`；
   其他非 0/1/2 → `rg_failed`；超时 → `rg_timeout`（`AF_RG_TIMEOUT`，默认 30s）
+- `AF_RG_TIMEOUT` 是**整次运行**的上限：读取 stdout 与等待进程退出共用这份预算。
+  读循环跑在 worker 线程上并按 deadline join，所以既不输出也不退出的 rg
+  （大文件、卡死的挂载点）不会永久占住一个线程池 worker；到点直接 kill
+- 截断（达到 `limit`）时我们会主动关闭管道，rg 可能被信号打断而返回非 0/1/2
+  的退出码；此时 `rg_failed` 会被吞掉，已拿到的结果照常返回
 - 行预览上限 2000 字符（截断加 `...`，不撕裂代理对）；单条 JSON 记录 64KB 上限；
   submatch 截 100 个
 
@@ -129,6 +134,13 @@ write 的特例：文件不存在且无回执 → 直接创建（`O_EXCL`，父�
 `always overrides any other ignore logic`——即 `.gitignore` 与隐藏文件规则对
 glob 工具不生效（V2 同样如此）。隐藏文件的防线是 deny 列表，不是 `--hidden`；
 grep 反而带 `--hidden`（会搜隐藏文件），因此更依赖 deny 转出的排除 glob。
+
+因此默认 deny（`*.env`、`*.env.*`）只挡这一类：`.npmrc`、`.aws/credentials`
+这些点文件对 glob **是可见的**，需要自己加进 `AF_READ_DENY`。
+
+**deny glob 写错会静默失效**：rg 无法解析的 glob 会让它直接退 2、不输出任何
+行，于是所有搜索都返回空（方向是安全的——不会泄漏，但运维毫无感知）。启动时
+会用空目录探测一遍 `AF_READ_DENY`，非法则在 stderr 告警。
 
 与 V2 的有意差异：V2 的 glob/grep 对 `path` **没有**逃逸校验，我们走
 `resolver.resolve()`；结果路径在 workspace 内是相对路径，白名单外部则返回
@@ -150,7 +162,7 @@ grep 反而带 `--hidden`（会搜隐藏文件），因此更依赖 deny 转出�
 | `AF_WRITE_DENY` | | JSON 数组，禁止**写入/编辑**的 wildcard，默认 `["*.env", "*.env.*"]`（与读黑名单独立） |
 | `AF_TRANSPORT_MAX` | | 单文件传输字节上限，默认 100MB |
 | `AF_RIPGREP_PATH` | | rg 可执行文件路径，默认在 PATH 上查找 |
-| `AF_RG_TIMEOUT` | | 单次 ripgrep 运行超时秒数，默认 30 |
+| `AF_RG_TIMEOUT` | | 单次 ripgrep 运行的整体时间上限（读输出 + 等退出），默认 30；必须 > 0 |
 | `AF_BODY_MAX` | | 单次请求体字节上限，默认 8MB（超限在鉴权**之前**返回 `413`，不缓冲） |
 
 启动：
@@ -278,11 +290,11 @@ packages/shared/agentfiles_shared/
 packages/server/agentfiles_server/
   app.py           FastAPI 装配 + transport 路由
   middleware.py    认证链：bearer → 签名头 → token → 时间戳 → nonce → 签名 → 重放
-  config.py        环境变量配置（白名单 / 读黑名单 / 写黑名单 / 传输上限）
+  config.py        环境变量配置（数值解析 / 白名单 / 读写黑名单 / 传输上限）
   fslayer.py       路径解析 / 逃逸校验 / 外部白名单
   filemut.py       严格模式句柄读写 + version 校验 + 目标锁 + BOM
   readfs.py        read 引擎：嗅探、分页、目录列表、图片校验；文本回执在此取 fstat
-  rg.py            ripgrep 适配：spawn / 退出码映射 / 行与记录上限 / deny 排除
+  rg.py            ripgrep 适配：spawn / 超时兜底 / 退出码映射 / 行与记录上限 / deny 排除与启动期校验
   transport.py     签名下载端点（containment + read-deny + 大小校验）
   tools/           read write edit glob grep
 packages/mcp/agentfiles_mcp/

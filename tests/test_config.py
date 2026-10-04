@@ -4,7 +4,14 @@ from __future__ import annotations
 
 import json
 
-from agentfiles_server.config import DEFAULT_BODY_MAX_BYTES, Config, load
+import pytest
+
+from agentfiles_server.config import (
+    DEFAULT_BODY_MAX_BYTES,
+    Config,
+    ConfigError,
+    load,
+)
 
 
 def _base_env(monkeypatch, workspace) -> None:
@@ -27,3 +34,18 @@ def test_body_max_comes_from_the_environment(tmp_path, monkeypatch):
 def test_body_max_falls_back_to_the_default(tmp_path, monkeypatch):
     _base_env(monkeypatch, tmp_path)
     assert load().max_body_bytes == DEFAULT_BODY_MAX_BYTES
+
+
+def test_rg_timeout_default_and_env(tmp_path, monkeypatch):
+    _base_env(monkeypatch, tmp_path)
+    assert load().rg_timeout == 30.0
+    monkeypatch.setenv("AF_RG_TIMEOUT", "2.5")
+    assert load().rg_timeout == 2.5
+
+
+@pytest.mark.parametrize("value", ["soon", "0", "-1"])
+def test_a_bad_number_is_a_config_error(tmp_path, monkeypatch, value):
+    _base_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("AF_RG_TIMEOUT", value)
+    with pytest.raises(ConfigError):
+        load()

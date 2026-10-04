@@ -9,14 +9,16 @@ from __future__ import annotations
 
 import os
 
-from agentfiles_shared.errors import ToolError, unable_to_find_files
+from agentfiles_shared.errors import (
+    SEARCH_TRANSPARENT_CODES,
+    ToolError,
+    unable_to_find_files,
+)
 from agentfiles_shared.schema import GlobInput
 
 from .. import rg
 from ..config import Config
 from ..fslayer import Resolver, contains, slash
-
-_TRANSPARENT_CODES = {"path_escape", "rg_unavailable", "rg_timeout", "rg_failed"}
 
 
 def execute(
@@ -27,7 +29,7 @@ def execute(
     except rg.InvalidPattern:
         raise unable_to_find_files(params.pattern) from None
     except ToolError as exc:
-        if exc.code in _TRANSPARENT_CODES:
+        if exc.code in SEARCH_TRANSPARENT_CODES:
             raise
         raise unable_to_find_files(params.pattern) from None
 

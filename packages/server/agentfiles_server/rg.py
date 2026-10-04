@@ -10,17 +10,25 @@ same way V2 does:
 Deny patterns from AF_READ_DENY are translated into ``--glob=!pattern``
 exclusions so a file that cannot be read also cannot be surfaced by search.
 
+AF_RG_TIMEOUT bounds the whole run: reading stdout happens on a worker thread
+that the caller joins against a deadline, because a rg that neither writes nor
+exits would otherwise block for as long as it likes.
+
 stderr is drained by a background thread from spawn time: a chatty rg would
 otherwise fill the pipe while we are still reading stdout and deadlock.
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
 import re
 import shutil
 import subprocess
+import tempfile
 import threading
+import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from agentfiles_shared.errors import ToolError
@@ -29,6 +37,11 @@ MAX_RECORD_BYTES = 64 * 1024
 MAX_SUBMATCHES = 100
 MAX_LINE_CHARS = 2_000
 ERROR_BYTES = 8 * 1024
+# a glob probe runs against an empty directory, where rg parses the globs
+# before walking anything
+PROBE_TIMEOUT = 10.0
+# a process wedged in uninterruptible IO can outlive kill()
+KILL_TIMEOUT = 5.0
 
 _INVALID_PATTERN = re.compile(r"regex parse error|error parsing regex")
 
@@ -67,14 +80,14 @@ class _Process:
         try:
             return self.handle.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
-            self.handle.kill()
-            self.handle.wait()
+            self.kill()
             raise ToolError("rg_timeout", "ripgrep exceeded the time limit") from None
 
     def kill(self) -> None:
         if self.handle.poll() is None:
             self.handle.kill()
-        self.handle.wait()
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                self.handle.wait(timeout=KILL_TIMEOUT)
 
     @property
     def stderr_text(self) -> str:
@@ -98,12 +111,15 @@ def _spawn(binary: str, args: list[str], cwd: str) -> _Process:
 
     def drain() -> None:
         assert handle.stderr is not None
-        # read until EOF but keep only the first ERROR_BYTES
-        while len(stderr) < ERROR_BYTES:
-            chunk = handle.stderr.read(min(4096, ERROR_BYTES - len(stderr) + 1))
+        while True:
+            # keep reading past the cap: rg blocks on a full stderr pipe, and
+            # a blocked rg never closes stdout
+            room = ERROR_BYTES - len(stderr)
+            chunk = handle.stderr.read(4096 if room <= 0 else min(4096, room))
             if not chunk:
                 return
-            stderr.extend(chunk)
+            if room > 0:
+                stderr.extend(chunk)
 
     thread = threading.Thread(target=drain, daemon=True)
     thread.start()
@@ -121,8 +137,56 @@ def _deny_globs(deny: list[str]) -> list[str]:
     return [f"--glob=!{pattern}" for pattern in deny]
 
 
-def _check_exit(process: _Process, timeout: float, pattern: str) -> int:
-    code = process.wait(timeout)
+@dataclass
+class _Deadline:
+    """Absolute monotonic deadline shared by the read loop and the exit wait."""
+
+    end: float
+
+    @classmethod
+    def from_timeout(cls, timeout: float) -> _Deadline:
+        return cls(end=time.monotonic() + timeout)
+
+    def remaining(self) -> float:
+        return max(0.0, self.end - time.monotonic())
+
+
+def _run_bounded(
+    process: _Process, deadline: _Deadline, consume: Callable[[], None]
+) -> None:
+    """Run ``consume`` on a worker thread, bounded by ``deadline``.
+
+    Iterating stdout has no deadline of its own, and handlers run off the
+    server's thread pool, so an unbounded read would park one worker per
+    stuck rg until the pool is exhausted.
+    """
+    failure: dict[str, BaseException] = {}
+
+    def worker() -> None:
+        try:
+            consume()
+        except BaseException as exc:  # noqa: BLE001 - replayed on the caller
+            failure["error"] = exc
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+    thread.join(deadline.remaining())
+    if thread.is_alive():
+        process.kill()
+        raise ToolError("rg_timeout", "ripgrep exceeded the time limit")
+
+    error = failure.get("error")
+    if error is not None:
+        process.kill()
+        raise error
+
+
+def _check_exit(process: _Process, deadline: _Deadline, pattern: str) -> int:
+    remaining = deadline.remaining()
+    if remaining == 0.0:
+        process.kill()
+        raise ToolError("rg_timeout", "ripgrep exceeded the time limit")
+    code = process.wait(remaining)
     stderr = process.stderr_text
     if code == 2 and _INVALID_PATTERN.search(stderr):
         raise InvalidPattern(pattern, stderr.strip())
@@ -131,6 +195,51 @@ def _check_exit(process: _Process, timeout: float, pattern: str) -> int:
             "rg_failed", stderr.strip() or f"ripgrep failed with code {code}"
         )
     return code
+
+
+def _collect(
+    process: _Process,
+    limit: int,
+    timeout: float,
+    pattern: str,
+    parse: Callable[[bytes], object | None],
+) -> RunResult:
+    deadline = _Deadline.from_timeout(timeout)
+    items: list = []
+    truncated = False
+
+    def consume() -> None:
+        nonlocal truncated
+        assert process.handle.stdout is not None
+        try:
+            for raw in process.handle.stdout:
+                if len(items) >= limit:
+                    truncated = True
+                    break
+                item = parse(raw)
+                if item is not None:
+                    items.append(item)
+        finally:
+            process.handle.stdout.close()
+
+    _run_bounded(process, deadline, consume)
+
+    if truncated:
+        try:
+            # we stopped reading on purpose; take the exit code without its rows
+            _check_exit(process, deadline, pattern)
+        except ToolError as exc:
+            # a closed pipe can end rg with a signal (-13 SIGPIPE on POSIX)
+            # rather than 0/1/2; that says nothing about the rows we already
+            # collected
+            if exc.code != "rg_failed":
+                raise
+        return RunResult(items=items, truncated=True)
+
+    code = _check_exit(process, deadline, pattern)
+    if code == 1:
+        items = []
+    return RunResult(items=items, truncated=False)
 
 
 # --- glob -------------------------------------------------------------------
@@ -143,48 +252,23 @@ def run_glob(
     limit: int,
     deny: list[str],
     timeout: float,
-    hidden: bool = False,
 ) -> RunResult:
     if limit <= 0:
         return RunResult()
-    args = ["--no-config", "--files"]
-    if hidden:
-        args.append("--hidden")
-    args += [
+    args = [
+        "--no-config",
+        "--files",
         f"--glob={pattern}",
         *_deny_globs(deny),
         "--glob=!**/.git/**",
         ".",
     ]
-    return _collect_lines(_spawn(binary, args, cwd), limit, timeout, pattern)
+    return _collect(_spawn(binary, args, cwd), limit, timeout, pattern, _parse_line)
 
 
-def _collect_lines(
-    process: _Process, limit: int, timeout: float, pattern: str
-) -> RunResult:
-    items: list[str] = []
-    truncated = False
-    assert process.handle.stdout is not None
-    try:
-        for raw in process.handle.stdout:
-            if len(items) >= limit:
-                truncated = True
-                break
-            line = raw.decode("utf-8", "replace").rstrip("\r\n")
-            if line:
-                items.append(_strip_prefix(line))
-    finally:
-        process.handle.stdout.close()
-
-    if truncated:
-        # we stopped reading on purpose; take the exit code without its rows
-        _check_exit(process, timeout, pattern)
-        return RunResult(items=items, truncated=True)
-
-    code = _check_exit(process, timeout, pattern)
-    if code == 1:
-        items = []
-    return RunResult(items=items, truncated=False)
+def _parse_line(raw: bytes) -> str | None:
+    line = raw.decode("utf-8", "replace").rstrip("\r\n")
+    return _strip_prefix(line) if line else None
 
 
 # --- grep -------------------------------------------------------------------
@@ -226,39 +310,34 @@ def run_grep(
         pattern,
         file if file is not None else ".",
     ]
-    return _collect_matches(_spawn(binary, args, cwd), limit, timeout, pattern)
+    return _collect(_spawn(binary, args, cwd), limit, timeout, pattern, _parse_record)
 
 
-def _collect_matches(
-    process: _Process, limit: int, timeout: float, pattern: str
-) -> RunResult:
-    matches: list[RawMatch] = []
-    truncated = False
-    assert process.handle.stdout is not None
-    try:
-        for raw in process.handle.stdout:
-            if len(matches) >= limit:
-                truncated = True
-                break
-            if len(raw) > MAX_RECORD_BYTES:
-                raise ToolError(
-                    "rg_failed",
-                    f"Ripgrep JSON record exceeded {MAX_RECORD_BYTES} bytes",
-                )
-            match = _parse_match(raw.decode("utf-8", "replace"))
-            if match is not None:
-                matches.append(match)
-    finally:
-        process.handle.stdout.close()
+def _parse_record(raw: bytes) -> RawMatch | None:
+    if len(raw) > MAX_RECORD_BYTES:
+        raise ToolError(
+            "rg_failed",
+            f"Ripgrep JSON record exceeded {MAX_RECORD_BYTES} bytes",
+        )
+    return _parse_match(raw.decode("utf-8", "replace"))
 
-    if truncated:
-        _check_exit(process, timeout, pattern)
-        return RunResult(items=matches, truncated=True)
 
-    code = _check_exit(process, timeout, pattern)
-    if code == 1:
-        matches = []
-    return RunResult(items=matches, truncated=False)
+def validate_deny_globs(binary: str, patterns: list[str]) -> str | None:
+    """Return rg's complaint about the first malformed deny glob, else None.
+
+    A glob rg cannot parse makes it exit 2 without reading anything, which
+    empties every search silently. The probe runs in an empty directory: rg
+    parses the globs before it walks, so startup pays nothing for it.
+    """
+    if not patterns:
+        return None
+    with tempfile.TemporaryDirectory() as empty:
+        process = _spawn(
+            binary, ["--no-config", "--files", *_deny_globs(patterns), "."], empty
+        )
+        if _check_exit(process, _Deadline.from_timeout(PROBE_TIMEOUT), "") == 2:
+            return process.stderr_text.strip() or "rejected by ripgrep"
+    return None
 
 
 def _parse_match(line: str) -> RawMatch | None:
@@ -309,7 +388,7 @@ def _parse_match(line: str) -> RawMatch | None:
 
 
 __all__ = [
-    "find_binary", "run_glob", "run_grep", "InvalidPattern", "RawMatch",
-    "RunResult", "MAX_RECORD_BYTES", "MAX_SUBMATCHES", "MAX_LINE_CHARS",
-    "ERROR_BYTES",
+    "find_binary", "run_glob", "run_grep", "validate_deny_globs", "InvalidPattern",
+    "RawMatch", "RunResult", "MAX_RECORD_BYTES", "MAX_SUBMATCHES",
+    "MAX_LINE_CHARS", "ERROR_BYTES",
 ]

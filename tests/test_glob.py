@@ -91,15 +91,19 @@ def test_limit_truncates(workspace):
     assert data["result"]["truncated"] is True
 
 
-def test_hidden_and_git_excluded(workspace):
+def test_git_excluded_but_dotfiles_visible(workspace):
     (workspace / ".git").mkdir()
     (workspace / ".git" / "config").write_text("x", encoding="utf-8")
+    (workspace / ".npmrc").write_text("token=1", encoding="utf-8")
     with make_client(workspace) as client:
         data = glob(client, pattern="**/*")
     paths = [e["path"] for e in data["result"]["entries"]]
-    # glob runs without --hidden (V2 behavior): hidden files never surface
+    # only --glob=!**/.git/** and AF_READ_DENY remove entries: the positive
+    # --glob overrides rg's hidden filter, so dotfiles are listed
     assert not any(p.startswith(".git") for p in paths)
     assert not any(p.endswith(".env") for p in paths)
+    # the default deny is *.env only, so this one is visible to the model
+    assert any(p.endswith(".npmrc") for p in paths)
 
 
 def test_deny_patterns_excluded(workspace):
