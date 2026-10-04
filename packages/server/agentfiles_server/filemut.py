@@ -180,15 +180,14 @@ def verify_opened(
     max_bytes: int | None = None,
     on_too_large=None,
     read_content: bool = True,
-) -> VersionedFile | None:
+) -> VersionedFile:
     """Adopt a handle that already passed containment/type/deny verification.
 
     ``opened`` is an ``fslayer.Opened``; ownership of its fd transfers to the
     returned VersionedFile on success, and is released here on failure (the
-    caller must not double-close). Returns None only when ``create`` semantics
-    apply and the caller may create the file -- encoded by callers checking
-    FileNotFoundError *before* reaching this function; kept for symmetry with
-    the old signature.
+    caller must not double-close). Creating a file that does not exist is not
+    this function's business: callers check FileNotFoundError themselves and go
+    through ``Resolver.create_file``.
 
     ``max_bytes`` bounds what is pulled into memory (``on_too_large`` is
     required with it). It is checked on the verified handle -- after the CAS,

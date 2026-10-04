@@ -42,13 +42,11 @@ def execute(
 def _run(
     resolver: Resolver, config: Config, params: GlobInput
 ) -> tuple[dict, str]:
-    # root = explicit path > request cwd > workspace (all verified below)
-    if params.path:
-        full = resolver.locate(params.path, params.cwd)
-    else:
-        full = params.cwd or resolver.root
+    # root = explicit path > request cwd > workspace. locate() is the only way
+    # in: it rejects poison and a relative cwd (which would otherwise resolve
+    # against the *process* cwd, since there is no path to join here).
+    full = resolver.locate(params.path or ".", params.cwd or resolver.root)
 
-    opened = None
     try:
         opened = resolver.open_checked(
             full, flags=OPEN_RDONLY, expect="dir",

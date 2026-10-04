@@ -31,6 +31,11 @@ from . import handlepath
 
 log = logging.getLogger("agentfiles")
 
+# path_escape reasons: server-side log vocabulary, never shown to the model
+# (the tools collapse path_escape into their generic Unable-to message).
+REASON_OUTSIDE_WORKSPACE = "outside_workspace"
+REASON_HANDLE_PATH_UNAVAILABLE = "handle_path_unavailable"
+
 
 def slash(path: str) -> str:
     """Normalize separators to ``/`` (V2 keeps resources posix-style on Windows)."""
@@ -159,13 +164,20 @@ class Resolver:
         OSError for the caller to map to its own tool message; containment,
         type and deny failures raise ToolError (path_escape is collapsed by
         the tools -- only logged here).
+
+        Patterns without the error to raise would fall through as
+        ``raise None``; an empty deny list with an error left over is fine
+        (that is what a server with no AF_*_DENY configured passes).
         """
+        if deny and on_deny is None:
+            raise ValueError("deny patterns need an on_deny error to raise")
+
         fd = handlepath.open_path(full, flags)
         try:
             real = handlepath.real_path_of_fd(fd)
             if not real:
                 # cannot determine what we opened -> fail closed
-                raise path_escape(full, "handle_path_unavailable")
+                raise path_escape(full, REASON_HANDLE_PATH_UNAVAILABLE)
 
             resource = self.resource_for(real)
             if resource is None:
@@ -173,7 +185,7 @@ class Resolver:
                     "containment rejected: %s resolved outside workspace (%s)",
                     full, real,
                 )
-                raise path_escape(full, "outside_workspace")
+                raise path_escape(full, REASON_OUTSIDE_WORKSPACE)
 
             st = os.fstat(fd)
             if expect == "file" and not statmod.S_ISREG(st.st_mode):
@@ -226,6 +238,9 @@ class Resolver:
         denied name produces no side effect at all. The created handle is
         re-verified (defense against an intermediate dir swapped mid-creation).
         """
+        if deny and on_deny is None:
+            raise ValueError("deny patterns need an on_deny error to raise")
+
         parent = os.path.dirname(full) or "."
         name = os.path.basename(full)
         anchor = parent
@@ -254,7 +269,7 @@ class Resolver:
                     "containment rejected: create target %s resolves outside workspace (%s)",
                     full, target_real,
                 )
-                raise path_escape(full, "outside_workspace")
+                raise path_escape(full, REASON_OUTSIDE_WORKSPACE)
             if deny:
                 lexical = self.resource_for(os.path.normpath(full))
                 if any(
@@ -281,7 +296,7 @@ class Resolver:
                         "containment rejected: created file %s is outside workspace (%s)",
                         target_real, real,
                     )
-                    raise path_escape(full, "outside_workspace")
+                    raise path_escape(full, REASON_OUTSIDE_WORKSPACE)
                 st = os.fstat(fd)
                 if not statmod.S_ISREG(st.st_mode):
                     from agentfiles_shared.errors import path_kind

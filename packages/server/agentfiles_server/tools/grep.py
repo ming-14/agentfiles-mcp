@@ -44,10 +44,10 @@ def execute(
 def _run(
     resolver: Resolver, config: Config, params: GrepInput
 ) -> tuple[dict, str]:
-    if params.path:
-        full = resolver.locate(params.path, params.cwd)
-    else:
-        full = params.cwd or resolver.root
+    # root = explicit path > request cwd > workspace, always through locate():
+    # a relative cwd with no path would otherwise resolve against the process
+    # cwd instead of the workspace
+    full = resolver.locate(params.path or ".", params.cwd or resolver.root)
 
     # verify the target through its handle first: deny is matched against the
     # real resource AND the lexical one (a .env symlinked as good.txt is

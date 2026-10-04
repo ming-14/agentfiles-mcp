@@ -8,7 +8,8 @@ string we computed ourselves. This module is the platform seam:
            handles need CreateFileW with FILE_FLAG_BACKUP_SEMANTICS because
            os.open() refuses directories.
   Linux    readlink /proc/self/fd/<n>
-  macOS    fcntl F_GETPATH (value 100, stable in XNU)
+  macOS    fcntl F_GETPATH (= 50, XNU sys/fcntl.h; not to be confused with
+           F_GETPATH_NOFIRMLINK = 102, nor with F_TRIM_ACTIVE_FILE = 100)
 
 Anything that cannot produce a real path returns None / raises -- callers
 must fail closed, never fall back to the lexical path.
@@ -30,6 +31,13 @@ O_BINARY = _O_BINARY
 # flag simply does not exist (no POSIX FIFOs there).
 OPEN_RDONLY = os.O_RDONLY | _O_BINARY | _O_NONBLOCK
 OPEN_RDWR = os.O_RDWR | _O_BINARY | _O_NONBLOCK
+
+# Kept at module scope (not inside the darwin branch) so the number is
+# assertable from any platform: it is a constant of XNU's ABI, and the wrong
+# value here would silently fail every macOS request closed.
+_F_GETPATH = 50
+# Linux readlink appends this to /proc/self/fd/<n> for an unlinked file.
+_LINUX_DELETED_SUFFIX = " (deleted)"
 
 if sys.platform == "win32":
     import ctypes
@@ -104,35 +112,50 @@ else:
 
     def real_path_of_fd(fd: int) -> str | None:
         if sys.platform == "darwin":
-            # F_GETPATH = 100 (XNU sys/fcntl.h); stable across macOS releases
             buf = bytearray(4096)
             try:
-                _fcntl.fcntl(fd, 100, buf)
+                _fcntl.fcntl(fd, _F_GETPATH, buf)
             except OSError:
                 return None
             raw = bytes(buf).split(b"\x00", 1)[0]
             return raw.decode("utf-8", "surrogateescape") or None
         try:
-            return os.readlink(f"/proc/self/fd/{fd}")
+            link = os.readlink(f"/proc/self/fd/{fd}")
         except OSError:
             return None
+        # A file unlinked after open reads back as "<path> (deleted)": drop the
+        # suffix, or the resource name carries it and deny patterns stop
+        # matching. A file genuinely named "x (deleted)" is then reported under
+        # its short name -- the wrong direction is the stricter one.
+        if link.endswith(_LINUX_DELETED_SUFFIX):
+            link = link[: -len(_LINUX_DELETED_SUFFIX)]
+        return link or None
 
     def open_dir(path: str) -> int:
         return os.open(path, os.O_RDONLY | _O_BINARY | _O_DIRECTORY)
 
 
+def _is_dir(path: str) -> bool:
+    try:
+        return os.path.isdir(path)
+    except OSError:
+        return False
+
+
 def open_path(path: str, flags: int) -> int:
     """Open a file or directory, returning a verified-ready fd.
 
-    On Windows os.open() raises PermissionError for directories; route those
-    to the CreateFileW path. A genuine access-denied on a *file* also lands
-    here, and open_dir() then raises its own OSError -- same class of failure
-    to the caller.
+    On Windows os.open() raises PermissionError for directories (CreateFileW
+    needs FILE_FLAG_BACKUP_SEMANTICS), so those route to open_dir(). The same
+    error also covers a genuine access-denied *file* (read-only, sharing
+    violation), so the fallback is gated on the target actually being a
+    directory: otherwise a read-only file would be handed back as a read-only
+    handle, pass the "is a regular file" check and only fail later, at write.
     """
     try:
         return os.open(path, flags)
     except PermissionError:
-        if sys.platform == "win32":
+        if sys.platform == "win32" and _is_dir(path):
             return open_dir(path)
         raise
 

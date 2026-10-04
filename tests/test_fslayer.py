@@ -133,17 +133,15 @@ def test_whitelist_is_prefix_scoped(workspace: Path, tmp_path: Path):
         open_ok(resolver, str(other / "note.md"))
 
 
-def test_symlink_escape_rejected(workspace: Path, tmp_path: Path):
+def test_link_escape_rejected(workspace: Path, tmp_path: Path, link_dir):
     """The whole point of open-then-verify: the kernel resolves the link and
     the handle's real path is outside containment."""
-    link = workspace / "leak"
-    outside_file = tmp_path / "outside.txt"
-    try:
-        os.symlink(str(outside_file), str(link))
-    except (OSError, NotImplementedError):
-        pytest.skip("symlinks unavailable on this platform")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("secret", encoding="utf-8")
+    link_dir(outside, workspace / "leak")
     with pytest.raises(ToolError) as exc:
-        open_ok(Resolver(str(workspace)), str(link))
+        open_ok(Resolver(str(workspace)), str(workspace / "leak"))
     assert exc.value.code == "path_escape"
 
 
@@ -178,35 +176,28 @@ def test_devices_and_pipes_are_rejected(workspace: Path, tmp_path: Path):
 
 # --- deny ---------------------------------------------------------------------
 
-def test_deny_matches_real_resource(workspace: Path, tmp_path: Path):
-    """good.txt symlinked to .env: the handle's real path is .env -> denied."""
-    secret = workspace / ".env"
-    secret.write_text("S=1")
-    link = workspace / "good.txt"
-    try:
-        os.symlink(str(secret), str(link))
-    except (OSError, NotImplementedError):
-        pytest.skip("symlinks unavailable on this platform")
+def test_deny_matches_real_resource(workspace: Path, link_dir):
+    """good.txt resolving to .env: the handle's real path is .env -> denied,
+    even though the name the caller asked for is innocent."""
+    (workspace / ".env").mkdir()
+    link_dir(workspace / ".env", workspace / "good.txt")
     resolver = Resolver(str(workspace))
     with pytest.raises(ToolError) as exc:
-        open_ok(resolver, str(link), deny=["*.env"],
+        open_ok(resolver, str(workspace / "good.txt"), deny=["*.env"],
                 on_deny=ToolError("read_deny", "denied"))
     assert exc.value.code == "read_deny"
 
 
-def test_deny_matches_lexical_resource(workspace: Path, tmp_path: Path):
-    """notes.txt symlinked pointing AT .env is denied by its real resource."""
-    secret = workspace / ".env"
-    secret.write_text("S=1")
-    link = workspace / "notes.txt"
-    try:
-        os.symlink(str(secret), str(link))
-    except (OSError, NotImplementedError):
-        pytest.skip("symlinks unavailable on this platform")
+def test_deny_matches_lexical_resource(workspace: Path, link_dir):
+    """.env resolving to an ordinary name: the real resource is clean, so it
+    is the lexical spelling that has to catch it."""
+    (workspace / "notes").mkdir()
+    link_dir(workspace / "notes", workspace / ".env")
     resolver = Resolver(str(workspace))
-    with pytest.raises(ToolError):
-        open_ok(resolver, str(link), deny=["*.env"],
+    with pytest.raises(ToolError) as exc:
+        open_ok(resolver, str(workspace / ".env"), deny=["*.env"],
                 on_deny=ToolError("read_deny", "denied"))
+    assert exc.value.code == "read_deny"
 
 
 def test_deny_miss_allows(workspace: Path):
@@ -214,6 +205,22 @@ def test_deny_miss_allows(workspace: Path):
     opened = open_ok(resolver, str(workspace / "src" / "main.ts"),
                      deny=["*.env"], on_deny=ToolError("read_deny", "denied"))
     assert opened.resource == "src/main.ts"
+
+
+def test_empty_deny_with_an_error_is_allowed(workspace: Path):
+    """A server with no AF_*_DENY configured passes an empty list; the error
+    rides along unused and must not be treated as a caller mistake."""
+    resolver = Resolver(str(workspace))
+    opened = open_ok(resolver, str(workspace / "src" / "main.ts"),
+                     deny=[], on_deny=ToolError("read_deny", "denied"))
+    assert opened.resource == "src/main.ts"
+
+
+def test_deny_without_an_error_is_a_caller_mistake(workspace: Path):
+    """Patterns with nothing to raise would fall through as `raise None`."""
+    resolver = Resolver(str(workspace))
+    with pytest.raises(ValueError):
+        open_ok(resolver, str(workspace / "src" / "main.ts"), deny=["*.env"])
 
 
 # --- create_file: parent verified first, deny before side effects ------------

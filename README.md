@@ -69,7 +69,9 @@ Headers:
 - **workspace** = 服务端配置的 `AF_WORKSPACE`，固定不变，安全边界
 - **cwd** = MCP 客户端**每请求**携带的字段（不是进程状态——服务端并发，绝不能
   `chdir`），相对路径以它为基准。它被校验但**不被信任**：最终打开的文件自己会
-  被句柄验证，cwd 只影响「定位」
+  被句柄验证，cwd 只影响「定位」。glob/grep 不传 `path` 时搜索根也取 cwd，
+  未设则回落到 workspace；`cwd` 不是绝对路径一律 `invalid_input`，绝不会退化成
+  进程自己的 cwd
 
 MCP 侧流程：启动时 cwd 为空 → 相对路径请求被 `cwd_not_set` 拦截（不落任何默认
 基准）→ 模型调用 `set_cwd` → 客户端问服务端 `POST /v1/cwd`（打开目录句柄验证，

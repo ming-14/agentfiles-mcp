@@ -217,15 +217,11 @@ def test_directory_offset_beyond_end_is_empty_not_error(client, workspace):
     assert data["result"]["entries"] == []
 
 
-def test_symlink_escape_filtered_from_listing(client, workspace, tmp_path):
+def test_link_escape_filtered_from_listing(client, workspace, tmp_path, link_dir):
     outside = tmp_path / "outside"
     outside.mkdir()
     (outside / "secret.txt").write_text("secret")
-    link = workspace / "leak"
-    try:
-        link.symlink_to(outside, target_is_directory=True)
-    except (OSError, NotImplementedError):
-        pytest.skip("symlinks unavailable")
+    link_dir(outside, workspace / "leak")
     data = read(client, ".").json()
     names = [e["path"] for e in data["result"]["entries"]]
     assert not any("leak" in n for n in names)
