@@ -150,6 +150,15 @@ def unable_to_grep(pattern: str) -> ToolError:
     return ToolError("unable_to_grep", f"Unable to grep for {pattern}")
 
 
+# --- request envelope -----------------------------------------------------
+
+def payload_too_large(size: int, limit: int) -> ToolError:
+    return ToolError(
+        "payload_too_large",
+        f"Request body is {size} bytes, exceeding the {limit} byte limit",
+    )
+
+
 # --- transport / path -----------------------------------------------------
 
 def invalid_input(detail: str) -> ToolError:

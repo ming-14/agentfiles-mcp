@@ -123,6 +123,7 @@ write 的特例：文件不存在且无回执 → 直接创建（`O_EXCL`，父�
 | `AF_READ_DENY` | | JSON 数组，禁止**读取**的 wildcard，默认 `["*.env", "*.env.*"]` |
 | `AF_WRITE_DENY` | | JSON 数组，禁止**写入/编辑**的 wildcard，默认 `["*.env", "*.env.*"]`（与读黑名单独立） |
 | `AF_TRANSPORT_MAX` | | 单文件传输字节上限，默认 100MB |
+| `AF_BODY_MAX` | | 单次请求体字节上限，默认 8MB（超限在鉴权**之前**返回 `413`，不缓冲） |
 
 启动：
 
@@ -166,6 +167,10 @@ GET  /v1/transport/download?path=<abs>   拉取文件字节（query 参与签名
 
 认证失败返回 `401`，响应体形状相同；`error.code` 是稳定值
 （`missing_authorization`、`unknown_token`、`bad_signature`…），客户端按它分流。
+
+请求体超过 `AF_BODY_MAX` 返回 `413`（`payload_too_large`）。长度检查排在鉴权
+**之前**：`Content-Length` 声明超限当场拒绝，没有长度声明的分块请求按累计字节
+在超限的那一刻停止缓冲——否则未鉴权的对端也能靠一个请求把内存吃满。
 
 `/v1/transport/download` 的非 200 状态（响应体形状同上）：
 

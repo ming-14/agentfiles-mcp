@@ -180,6 +180,7 @@ def open_verified(
     create: bool,
     max_bytes: int | None = None,
     on_too_large=None,
+    read_content: bool = True,
 ) -> VersionedFile | None:
     """Open and verify ``canonical``; return None when the caller may create it.
 
@@ -190,6 +191,11 @@ def open_verified(
     required with it). It is checked on the verified handle -- after the CAS,
     so a stale marker still answers ``on_mismatch``, and before the read, so
     an oversized file is never slurped.
+
+    read_content=False (write tool): only the BOM probe bytes are read and
+    ``content`` stays empty. write replaces every byte anyway, so pulling a
+    possibly huge old file into memory to learn whether it started with three
+    marker bytes would buy nothing.
     """
     try:
         fd = os.open(canonical, os.O_RDWR | _O_BINARY)
@@ -207,15 +213,16 @@ def open_verified(
             # file exists but the client never read it
             raise on_missing
         # One fstat: the CAS check, and the baseline verify_unchanged compares
-        # against. It has to precede _read_all -- otherwise a modification
-        # landing inside the read becomes the baseline itself.
+        # against. It has to precede the read -- otherwise a modification
+        # landing inside it becomes the baseline itself.
         stat = os.fstat(fd)
         _verify(stat, expected, canonical, on_mismatch)
         if max_bytes is not None and stat.st_size > max_bytes:
             raise on_too_large
-        content = _read_all(fd)
-        had_bom, _ = split_bom(content)
-        return VersionedFile(fd=fd, canonical=canonical, content=content,
+        probe = _read_all(fd) if read_content else _read_prefix(fd, len(_BOM))
+        had_bom, _ = split_bom(probe)
+        return VersionedFile(fd=fd, canonical=canonical,
+                             content=probe if read_content else b"",
                              had_bom=had_bom, before=stat)
     except BaseException:
         os.close(fd)
@@ -231,6 +238,12 @@ def _read_all(fd: int) -> bytes:
             break
         chunks.append(chunk)
     return b"".join(chunks)
+
+
+def _read_prefix(fd: int, size: int) -> bytes:
+    """First ``size`` bytes -- all the BOM probe has to look at."""
+    os.lseek(fd, 0, os.SEEK_SET)
+    return os.read(fd, size)
 
 
 def verify_unchanged(handle: VersionedFile, on_mismatch) -> None:

@@ -47,7 +47,12 @@ def create_app(config: Config) -> FastAPI:
     # app.state, so nothing depends on the ASGI lifespan having run.
     resolver = Resolver(config.workspace, config.external_whitelist)
     app = FastAPI(title="agentfiles-server")
-    app.add_middleware(AuthMiddleware, tokens=config.tokens, max_skew=config.max_skew)
+    app.add_middleware(
+        AuthMiddleware,
+        tokens=config.tokens,
+        max_skew=config.max_skew,
+        max_body=config.max_body_bytes,
+    )
 
     @app.get("/healthz")
     async def healthz() -> dict:

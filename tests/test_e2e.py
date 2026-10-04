@@ -276,3 +276,89 @@ async def test_non_object_body_is_remote_error():
     with pytest.raises(RemoteError):
         await tool_client.call("read", {"path": "x"})
     await tool_client.aclose()
+
+
+# --- request body limit ------------------------------------------------------
+
+def body_of_size(size: int) -> bytes:
+    """A well-formed request whose serialized length is exactly ``size``."""
+    pad = size - len('{"path":""}')
+    assert pad > 0
+    body = json.dumps({"path": "x" * pad}, separators=(",", ":")).encode()
+    assert len(body) == size
+    return body
+
+
+def limited_client(tmp_path, limit: int) -> TestClient:
+    app = create_app(
+        ServerConfig(workspace=str(tmp_path), tokens={TOKEN: SECRET},
+                     max_body_bytes=limit)
+    )
+    return TestClient(app)
+
+
+def test_oversized_body_is_refused(tmp_path):
+    client = limited_client(tmp_path, 1024)
+    resp = raw_post(client, "/v1/write", body_of_size(4096))
+    assert resp.status_code == 413
+    assert resp.json() == {
+        "ok": False,
+        "error": {
+            "code": "payload_too_large",
+            "message": "Request body is 4096 bytes, exceeding the 1024 byte limit",
+        },
+    }
+
+
+def test_body_at_the_limit_still_reaches_the_handler(tmp_path):
+    client = limited_client(tmp_path, 1024)
+    resp = raw_post(client, "/v1/read", body_of_size(1024))
+    assert resp.status_code == 200
+    assert resp.json()["error"]["code"] == "unable_to_read"
+
+
+def test_oversized_body_is_refused_before_authentication(tmp_path):
+    """The limit has to hold without credentials too -- that is what stops an
+    unauthenticated client from buffering an unbounded body."""
+    client = limited_client(tmp_path, 1024)
+    resp = client.post("/v1/read", content=body_of_size(4096))
+    assert resp.status_code == 413
+    assert resp.json()["error"]["code"] == "payload_too_large"
+
+
+async def test_client_surfaces_payload_too_large(tmp_path):
+    """A 413 envelope reaches the model as a tool error, not a transport one."""
+    app = create_app(
+        ServerConfig(workspace=str(tmp_path), tokens={TOKEN: SECRET},
+                     max_body_bytes=1024)
+    )
+    tool_client = _asgi_client(app)
+    with pytest.raises(ToolError) as exc:
+        await tool_client.call("write", {"path": "big.txt", "content": "x" * 4096})
+    assert exc.value.code == "payload_too_large"
+    await tool_client.aclose()
+
+
+async def test_body_without_a_length_is_cut_off_mid_stream():
+    """Chunked requests carry no Content-Length: the running total has to stop
+    the read at the limit -- and stop, instead of draining what follows."""
+    from agentfiles_server.middleware import BodyTooLarge, read_body
+    from starlette.requests import Request
+
+    pulled = 0
+
+    async def receive():
+        nonlocal pulled
+        pulled += 1
+        if pulled > 2:
+            raise AssertionError("body was read past the limit")
+        return {"type": "http.request", "body": b"x" * 600, "more_body": True}
+
+    request = Request(
+        {"type": "http", "method": "POST", "path": "/v1/read", "headers": []},
+        receive,
+    )
+    with pytest.raises(BodyTooLarge) as exc:
+        await read_body(request, 1024)
+    assert exc.value.size == 1200
+    assert pulled == 2

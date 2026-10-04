@@ -171,6 +171,25 @@ def test_write_ascii_into_cjk_leading_file_adds_no_bom(workspace):
     assert (workspace / "c.txt").read_bytes() == b"plain\n"
 
 
+def test_write_only_probes_the_old_file_for_a_bom(workspace, monkeypatch):
+    """write replaces every byte, so the old file must not be pulled into
+    memory just to learn whether it started with a BOM."""
+    from agentfiles_server import filemut
+
+    (workspace / "big.txt").write_bytes(b"\xef\xbb\xbf" + b"a" * 1_000_000)
+
+    def boom(*args, **kwargs):
+        raise AssertionError("write must not read the whole old file")
+
+    monkeypatch.setattr(filemut, "_read_all", boom)
+    with make_client(workspace) as client:
+        version = read_version(client, "big.txt")
+        data = write(client, "big.txt", "short", version)
+    assert data["ok"] is True, data
+    # the BOM came from the prefix probe, so it survives
+    assert (workspace / "big.txt").read_bytes() == b"\xef\xbb\xbfshort"
+
+
 # --- policy -----------------------------------------------------------------
 
 def test_write_deny_blocks_even_after_read(workspace):

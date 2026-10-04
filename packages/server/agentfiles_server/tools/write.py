@@ -62,6 +62,8 @@ def _run(
             on_missing=filemut.version_missing_write(),
             on_mismatch=filemut.version_mismatch_write(),
             create=True,
+            # write replaces every byte: only the BOM prefix is worth reading
+            read_content=False,
         )
         existed = handle is not None
         try:

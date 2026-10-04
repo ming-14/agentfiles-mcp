@@ -13,6 +13,8 @@ AF_READ_DENY            JSON array of wildcard patterns that may never be read
 AF_WRITE_DENY           JSON array of wildcard patterns that may never be
                         written/edited (default ["*.env", "*.env.*"])
 AF_TRANSPORT_MAX        max bytes for a single file transport, default 100MB
+AF_BODY_MAX             max bytes for a single request body, default 8MB
+                        (a larger body is refused before it is buffered)
 """
 
 from __future__ import annotations
@@ -25,6 +27,9 @@ from agentfiles_shared.auth import DEFAULT_MAX_SKEW
 from agentfiles_shared.transport import DEFAULT_TRANSPORT_MAX_BYTES
 
 DEFAULT_READ_DENY = ["*.env", "*.env.*"]
+# A tool call carries JSON arguments, not file contents: write is the only
+# body that can be big, and anything a model can produce fits in here.
+DEFAULT_BODY_MAX_BYTES = 8 * 1024 * 1024
 
 
 class ConfigError(Exception):
@@ -56,6 +61,7 @@ class Config:
     read_deny: list[str] = field(default_factory=lambda: list(DEFAULT_READ_DENY))
     write_deny: list[str] = field(default_factory=lambda: list(DEFAULT_READ_DENY))
     transport_max: int = DEFAULT_TRANSPORT_MAX_BYTES
+    max_body_bytes: int = DEFAULT_BODY_MAX_BYTES
 
     @property
     def tls_enabled(self) -> bool:
@@ -94,5 +100,8 @@ def load() -> Config:
         write_deny=_json_list("AF_WRITE_DENY", DEFAULT_READ_DENY),
         transport_max=int(
             os.environ.get("AF_TRANSPORT_MAX", str(DEFAULT_TRANSPORT_MAX_BYTES))
+        ),
+        max_body_bytes=int(
+            os.environ.get("AF_BODY_MAX", str(DEFAULT_BODY_MAX_BYTES))
         ),
     )
