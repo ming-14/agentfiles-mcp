@@ -15,6 +15,8 @@ AF_WRITE_DENY           JSON array of wildcard patterns that may never be
 AF_TRANSPORT_MAX        max bytes for a single file transport, default 100MB
 AF_BODY_MAX             max bytes for a single request body, default 8MB
                         (a larger body is refused before it is buffered)
+AF_RIPGREP_PATH         path to the rg binary (default: search PATH)
+AF_RG_TIMEOUT           seconds a single ripgrep run may take, default 30
 """
 
 from __future__ import annotations
@@ -62,6 +64,8 @@ class Config:
     write_deny: list[str] = field(default_factory=lambda: list(DEFAULT_READ_DENY))
     transport_max: int = DEFAULT_TRANSPORT_MAX_BYTES
     max_body_bytes: int = DEFAULT_BODY_MAX_BYTES
+    ripgrep_path: str | None = None
+    rg_timeout: float = 30.0
 
     @property
     def tls_enabled(self) -> bool:
@@ -104,4 +108,6 @@ def load() -> Config:
         max_body_bytes=int(
             os.environ.get("AF_BODY_MAX", str(DEFAULT_BODY_MAX_BYTES))
         ),
+        ripgrep_path=os.environ.get("AF_RIPGREP_PATH") or None,
+        rg_timeout=float(os.environ.get("AF_RG_TIMEOUT", "30")),
     )

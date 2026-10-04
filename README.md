@@ -108,6 +108,32 @@ write/edit 采用**严格模式**：写入必须发生在通过校验的那个�
 write 的特例：文件不存在且无回执 → 直接创建（`O_EXCL`，父目录自动建）；
 文件已存在且无回执 → 拒绝覆盖。
 
+### 搜索（glob / grep）
+
+两者都委托给本机的 **ripgrep**（`AF_RIPGREP_PATH`，默认 PATH 查找 `rg`），
+参数与退出码映射对齐 V2：
+
+- `glob`：`--no-config --files --glob=<pattern> --glob=!**/.git/** .`
+- `grep`：`--no-config --json --hidden --no-messages [--glob=<include>] ... -- <pattern> <path>`
+- 退出码 `1` → 无结果；`2` + 正则错误 → 归并成 `Unable to grep for <pattern>`；
+  其他非 0/1/2 → `rg_failed`；超时 → `rg_timeout`（`AF_RG_TIMEOUT`，默认 30s）
+- 行预览上限 2000 字符（截断加 `...`，不撕裂代理对）；单条 JSON 记录 64KB 上限；
+  submatch 截 100 个
+
+**deny 防线**：`AF_READ_DENY` 的每个模式都会转成 `--glob=!pattern` 传给 rg——
+读不到的文件在搜索结果里也**不可见**（否则 grep 会把 `.env` 内容搜出来）。
+单文件目标（`path` 指向文件）会被 rg 当作命令行参数、绕过 glob 排除，
+所以工具层在 spawn 前单独校验 deny。
+
+**正向 glob 覆盖 ignore**：ripgrep 明确规定 `--glob=<pattern>` 这类正向 glob
+`always overrides any other ignore logic`——即 `.gitignore` 与隐藏文件规则对
+glob 工具不生效（V2 同样如此）。隐藏文件的防线是 deny 列表，不是 `--hidden`；
+grep 反而带 `--hidden`（会搜隐藏文件），因此更依赖 deny 转出的排除 glob。
+
+与 V2 的有意差异：V2 的 glob/grep 对 `path` **没有**逃逸校验，我们走
+`resolver.resolve()`；结果路径在 workspace 内是相对路径，白名单外部则返回
+绝对路径。modelText 一律渲染绝对路径（对齐 V2 渲染前的 resolve）。
+
 ## 服务端
 
 环境变量：
@@ -123,6 +149,8 @@ write 的特例：文件不存在且无回执 → 直接创建（`O_EXCL`，父�
 | `AF_READ_DENY` | | JSON 数组，禁止**读取**的 wildcard，默认 `["*.env", "*.env.*"]` |
 | `AF_WRITE_DENY` | | JSON 数组，禁止**写入/编辑**的 wildcard，默认 `["*.env", "*.env.*"]`（与读黑名单独立） |
 | `AF_TRANSPORT_MAX` | | 单文件传输字节上限，默认 100MB |
+| `AF_RIPGREP_PATH` | | rg 可执行文件路径，默认在 PATH 上查找 |
+| `AF_RG_TIMEOUT` | | 单次 ripgrep 运行超时秒数，默认 30 |
 | `AF_BODY_MAX` | | 单次请求体字节上限，默认 8MB（超限在鉴权**之前**返回 `413`，不缓冲） |
 
 启动：
@@ -254,6 +282,7 @@ packages/server/agentfiles_server/
   fslayer.py       路径解析 / 逃逸校验 / 外部白名单
   filemut.py       严格模式句柄读写 + version 校验 + 目标锁 + BOM
   readfs.py        read 引擎：嗅探、分页、目录列表、图片校验；文本回执在此取 fstat
+  rg.py            ripgrep 适配：spawn / 退出码映射 / 行与记录上限 / deny 排除
   transport.py     签名下载端点（containment + read-deny + 大小校验）
   tools/           read write edit glob grep
 packages/mcp/agentfiles_mcp/
