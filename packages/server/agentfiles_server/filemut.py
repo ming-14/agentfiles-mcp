@@ -10,8 +10,9 @@ Guarantees (the "strict" in strict mode):
   * version markers come from one fstat: mtime_ns, size and the file identity
     (st_ino/st_dev), integer nanoseconds
 
-Locks are per-canonical-path and process-local, mirroring V2's KeyedMutex.
-Handlers run in a threadpool, so these are threading.Lock, not asyncio.
+Locks are per-target (a resolved path, so two spellings of one file share one),
+process-local, mirroring V2's KeyedMutex. Handlers run in a threadpool, so
+these are threading.Lock, not asyncio.
 """
 
 from __future__ import annotations
@@ -36,9 +37,19 @@ _locks: dict[str, threading.Lock] = {}
 _locks_in_use: dict[str, int] = {}
 
 
+def _lock_key(path: str) -> str:
+    """One key per target, whatever spelling located it.
+
+    locate() output can carry a link the kernel resolves away at open time, and
+    two spellings that keyed apart would share no exclusion. Keying is the only
+    decision made from the string: containment and deny stay the handle's.
+    """
+    return os.path.normcase(os.path.realpath(path))
+
+
 @contextlib.contextmanager
-def target_lock(canonical: str) -> Iterator[threading.Lock]:
-    """Per-canonical-path mutual exclusion; process-local, like V2's KeyedMutex.
+def target_lock(path: str) -> Iterator[threading.Lock]:
+    """Per-target mutual exclusion; process-local, like V2's KeyedMutex.
 
     Entries are reference-counted rather than evicted on release: a long-lived
     server must not keep one lock per path it has ever mutated, but the object
@@ -48,7 +59,7 @@ def target_lock(canonical: str) -> Iterator[threading.Lock]:
     ``with target_lock(path):``, and a context manager that only yielded the
     Lock would be a critical section in appearance only.
     """
-    key = canonical.replace("\\", "/").lower() if os.name == "nt" else canonical
+    key = _lock_key(path)
     with _locks_guard:
         lock = _locks.get(key)
         if lock is None:
@@ -130,9 +141,10 @@ def version_of(fd: int, canonical: str) -> Version:
 
 
 def _same_path(a: str, b: str) -> bool:
-    norm = (lambda p: p.replace("\\", "/").lower()) if os.name == "nt" else \
-           (lambda p: p.replace("\\", "/"))
-    return norm(a) == norm(b)
+    # normcase is the platform's own folding (case and separators on Windows,
+    # nothing on POSIX): folding "\\" by hand would call /ws/a\b.txt and
+    # /ws/a/b.txt the same file, which on POSIX they are not
+    return os.path.normcase(a) == os.path.normcase(b)
 
 
 def _matches(stat: os.stat_result, mtime_ns: int, size: int, ino: int,

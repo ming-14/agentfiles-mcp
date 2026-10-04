@@ -6,7 +6,7 @@ import os
 
 import pytest
 
-from agentfiles_server.filemut import join_bom, split_bom
+from agentfiles_server.filemut import _lock_key, join_bom, split_bom
 
 BOM = b"\xef\xbb\xbf"
 
@@ -122,20 +122,23 @@ def test_matches_falls_back_to_mtime_and_size_without_inodes():
     assert filemut._matches(stat, 111, 9, 0, 0) is False
 
 
+def test_same_path_folds_separators_only_where_they_are_separators():
+    """A backslash separates on Windows and is a legal name character on
+    POSIX: folding it unconditionally would call two files the same there."""
+    from agentfiles_server import filemut
+
+    assert filemut._same_path("/ws/a\\b.txt", "/ws/a/b.txt") is (os.name == "nt")
+
+
 # --- target_lock: the table must not grow forever ----------------------------
-
-def _key(path: str) -> str:
-    """Mirror of filemut's lock-table key normalization."""
-    return path.replace("\\", "/").lower() if os.name == "nt" else path
-
 
 def test_target_lock_entry_is_released_when_idle():
     from agentfiles_server import filemut
 
     key = "lock-table-test.txt"  # keys are paths; no filesystem is involved
     with filemut.target_lock(key):
-        assert _key(key) in filemut._locks
-    assert _key(key) not in filemut._locks
+        assert _lock_key(key) in filemut._locks
+    assert _lock_key(key) not in filemut._locks
 
 
 def test_target_lock_yields_a_held_lock():
@@ -210,8 +213,25 @@ def test_target_lock_entry_lives_while_a_caller_holds_it():
     thread.start()
     try:
         assert entered.wait(5)
-        assert _key(key) in filemut._locks  # still referenced by the holder
+        assert _lock_key(key) in filemut._locks  # still referenced by the holder
     finally:
         release.set()
         thread.join(5)
-    assert _key(key) not in filemut._locks
+    assert _lock_key(key) not in filemut._locks
+
+
+def test_one_lock_per_target_whatever_spelling_located_it(link_dir, tmp_path):
+    """locate() output can carry a link the kernel resolves away at open time;
+    two spellings of one file that keyed apart would share no exclusion, and
+    both callers would verify against a stat taken before either wrote."""
+    from agentfiles_server import filemut
+
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "link"
+    link_dir(real, link)
+
+    through_link = _lock_key(str(link / "a.txt"))
+    assert through_link == _lock_key(str(real / "a.txt"))
+    with filemut.target_lock(str(link / "a.txt")) as held:
+        assert filemut._locks[through_link] is held
