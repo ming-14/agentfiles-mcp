@@ -37,7 +37,7 @@ def _scrub(value: Any) -> Any:
     """Walk a response body and make every string in it encodable."""
     if isinstance(value, str):
         return display_path(value)
-    if isinstance(value, list):
+    if isinstance(value, (list, tuple)):
         return [_scrub(item) for item in value]
     if isinstance(value, dict):
         return {key: _scrub(item) for key, item in value.items()}
@@ -45,9 +45,13 @@ def _scrub(value: Any) -> Any:
 
 
 def _json(content: dict, status_code: int = 200) -> JSONResponse:
-    """Every response leaves through here: one undecodable byte in a name
-    would otherwise fail rendering after the route returned, and the caller
-    would see a bare 500 instead of an envelope."""
+    """Every response leaves through here.
+
+    A name taken off the filesystem may carry bytes that are not valid UTF-8,
+    and no JSON response can encode those: rendering fails once the route has
+    already returned, so the caller gets a bare 500 instead of an envelope --
+    a place the route's own try/except cannot reach.
+    """
     return JSONResponse(status_code=status_code, content=_scrub(content))
 
 

@@ -274,6 +274,21 @@ GET  /v1/transport/download?path=<abs>   拉取文件字节（query 参与签名
 | `404` | 不存在、不是文件、**或 containment 逃逸**——三者同一文案（`transport_unavailable`），该通道无法用来测绘 workspace 外部 |
 | `413` | 超过 `AF_TRANSPORT_MAX`（`transport_too_large`） |
 
+### 文件名里的非 UTF-8 字节
+
+POSIX 允许文件名含任意字节，Python 把无法解码的部分表示成 lone surrogate，
+而 JSON 响应编码不了它——渲染失败发生在路由返回**之后**，模型的调用只得到一次
+裸 500（`text/plain`），连错误信封都没有。路由自己的 `try/except` 到不了那一层。
+
+所有工具响应都从同一个出口出去，途中每个字符串都被净化：不可解码的字节变成
+`U+FFFD`。这与 ripgrep 字节输出对同一个名字给出的拼写一致（glob/grep 本来就
+是这样），所以列表与搜索对同一个文件的说法不会打架。
+
+代价是这类名字**不可回用**：模型拿 `U+FFFD` 拼写去 `read` 会得到
+`unable_to_read`。这是取舍，不是 bug——另一种做法（把响应整段转义以保留原字节）
+在 MCP stdio 上照样过不去：host 侧序列化请求时就会失败。文件内容本身不受影响，
+被改写的只有展示给模型的那部分文本。
+
 ## 本地 MCP
 
 环境变量：
@@ -324,7 +339,7 @@ MCP 输入 schema 与 REST 请求体校验是同一份定义，改一处两边�
 
 ```bash
 uv sync              # 安装三个 workspace 成员（editable）+ dev 依赖
-uv run pytest -q     # 全量单测（symlink 用例在部分平台自动跳过）
+uv run pytest -q     # 全量单测（平台相关用例自动跳过：symlink、跨盘符、root）
 ```
 
 没有 uv 也可以用 pip：
@@ -354,6 +369,7 @@ packages/server/agentfiles_server/
   middleware.py    认证链：bearer → 签名头 → token → 时间戳 → nonce → 签名 → 重放
   config.py        环境变量配置（数值解析 / 白名单 / 读写黑名单 / 传输上限）
   fslayer.py       locate（字符串只定位）+ open_checked（句柄级裁决）+ create_file
+                   + display_path（名字的可显示形：非 UTF-8 字节 → U+FFFD）
   handlepath.py    平台层：句柄真实路径（Win GetFinalPathNameByHandleW / proc fd /
                    F_GETPATH）+ Windows 目录句柄
   filemut.py       严格模式句柄读写 + version 校验 + 目标锁 + BOM

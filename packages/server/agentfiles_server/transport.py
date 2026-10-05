@@ -72,8 +72,8 @@ def download(resolver: Resolver, config: Config, raw_path: str):
     if not os.path.isabs(raw_path):
         return _error(invalid_input("path must be an absolute path"), status=400)
 
-    # messages quote the path, and a name may hold bytes no JSON response can
-    # encode; only the text the model sees is made printable
+    # error envelopes quote the path, and a name may hold bytes no JSON body
+    # can carry; the file itself is still located by raw_path below
     shown = display_path(raw_path)
     try:
         opened = resolver.open_checked(

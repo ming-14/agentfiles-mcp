@@ -35,6 +35,21 @@ def _error_payload(response: httpx.Response) -> dict[str, Any] | None:
     return None
 
 
+def _body(payload: dict[str, Any]) -> bytes:
+    """Signed request body.
+
+    A path may hold bytes that are not valid UTF-8; those cannot go on the
+    wire, and replacing them lossily would silently address another file, so
+    the caller gets a tool error instead.
+    """
+    try:
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ToolError(
+            "invalid_input", "argument holds bytes that are not valid UTF-8"
+        ) from exc
+
+
 def _tool_error(error: Any, fallback_message: str) -> ToolError:
     """ToolError from an error envelope; tolerates a malformed envelope."""
     if not isinstance(error, dict):
@@ -88,7 +103,7 @@ class ToolClient:
         ToolError (invalid_cwd / invalid_input) when it is not an accessible
         directory inside containment.
         """
-        body = json.dumps({"path": path}, ensure_ascii=False).encode("utf-8")
+        body = _body({"path": path})
         headers = build_headers(
             token=self._config.token,
             secret=self._config.secret,
@@ -124,14 +139,7 @@ class ToolClient:
         RemoteError for transport problems.
         """
         path = f"/v1/{tool}"
-        try:
-            body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-        except UnicodeEncodeError as exc:
-            # a path carrying undecodable bytes cannot go on the wire; encoding
-            # it lossily would silently address a different file
-            raise ToolError(
-                "invalid_input", "argument holds bytes that are not valid UTF-8"
-            ) from exc
+        body = _body(payload)
         headers = build_headers(
             token=self._config.token,
             secret=self._config.secret,

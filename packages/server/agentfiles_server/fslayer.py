@@ -96,15 +96,8 @@ class Opened:
 
 
 def display_path(text: str) -> str:
-    """Text on its way back to the model, with undecodable bytes made
-    printable.
-
-    Names taken off the filesystem carry bytes that are not valid UTF-8 as
-    lone surrogates, and no JSON response can encode those: rendering fails
-    after the route has already returned, so the caller sees a bare 500
-    instead of an envelope. Those bytes become U+FFFD -- the same spelling
-    rg's byte output already yields for the same names.
-    """
+    """Make text encodable: bytes that are not valid UTF-8 become U+FFFD,
+    the spelling rg's byte output already yields for the same names."""
     if text.isascii():
         return text
     return text.encode("utf-8", "surrogateescape").decode("utf-8", "replace")
