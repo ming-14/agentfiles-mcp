@@ -1,10 +1,10 @@
 """read tool — open-then-verify, unified error surface.
 
 Flow: locate (poison/cwd) -> open handle -> verify THE HANDLE (containment,
-type, deny) -> list or read through that fd. Everything except the four
-actionable V2 categories collapses to `Unable to read <path>`: containment
-failures included, so a probed path cannot be distinguished from a missing
-one (the reason is logged server-side).
+type, deny) -> list or read through that fd. Everything except the actionable
+codes below collapses to `Unable to read <path>`: containment failures
+included, so a probed path cannot be distinguished from a missing one (the
+reason is logged server-side).
 """
 
 from __future__ import annotations
@@ -21,11 +21,16 @@ from ..fslayer import Resolver
 from ..handlepath import OPEN_RDONLY
 
 # verbatim to the model: content/policy facts the model can act on.
-# path_escape / path_kind / cwd errors are deliberately NOT here (see docstring);
-# cwd_not_set stays because it tells the model how to proceed, and
-# invalid_input because the fix is in the model's own arguments.
+# path_escape / path_kind / invalid_cwd are deliberately NOT here (see
+# docstring); cwd_not_set stays because it tells the model how to proceed,
+# and invalid_input because the fix is in the model's own arguments.
+# malformed_utf8 and offset_out_of_range are raised only once the handle is
+# verified, so they leak nothing about the filesystem; they are facts about
+# the file and about the arguments asked for, the way binary_file already is.
 _TRANSPARENT_CODES = {
     "binary_file",
+    "malformed_utf8",
+    "offset_out_of_range",
     "media_ingest_limit",
     "image_decode",
     "image_size",

@@ -88,10 +88,13 @@ def test_missing_file_maps_to_generic_error(client):
     assert data["error"]["message"] == "Unable to read nope.txt"
 
 
-def test_invalid_utf8_maps_to_generic_error(client, workspace):
+def test_invalid_utf8_is_reported(client, workspace):
+    """Same granularity as binary_file: the model is told what is wrong with
+    the file, so it stops trying to read it as text."""
     (workspace / "bad.txt").write_bytes(b"ok\xff\xfe\xff")
     data = read(client, "bad.txt").json()
-    assert data["error"]["message"] == "Unable to read bad.txt"
+    assert data["error"]["code"] == "malformed_utf8"
+    assert data["error"]["message"] == "File is not valid UTF-8: bad.txt"
 
 
 def test_binary_extension(client, workspace):
@@ -148,9 +151,12 @@ def test_large_file_is_paged_without_offset(client, workspace):
 
 
 def test_offset_out_of_range(client, workspace):
+    """Out of range is the model's own argument being wrong, so it is told
+    which offset rather than just that the read failed."""
     make_text_file(workspace, "tiny.txt", "one\ntwo\n")
     data = read(client, "tiny.txt", offset=99).json()
-    assert data["error"]["message"] == "Unable to read tiny.txt"
+    assert data["error"]["code"] == "offset_out_of_range"
+    assert data["error"]["message"] == "Offset 99 is out of range"
 
 
 def test_long_line_is_truncated(client, workspace):
