@@ -1,7 +1,8 @@
 """grep tool — verified search root, deny exclusions, V2 rendering.
 
-The root (path / request cwd / workspace) and any single-file target are
-opened and verified through their handles before ripgrep sees them: rg
+The root (path or request cwd -- there is no workspace fallback: a relative
+root with no cwd is ``cwd_not_set``, as everywhere else) and any single-file
+target are opened and verified through their handles before ripgrep sees them: rg
 follows command-line files even past its ignore rules, so the file it is
 handed must already be containment-checked. Deny patterns also ride along as
 ``--glob=!`` exclusions for the walk itself. path_escape collapses into the
@@ -47,10 +48,9 @@ def execute(
 def _run(
     resolver: Resolver, config: Config, params: GrepInput
 ) -> tuple[dict, str]:
-    # root = explicit path > request cwd > workspace, always through locate():
-    # a relative cwd with no path would otherwise resolve against the process
-    # cwd instead of the workspace
-    full = resolver.locate(params.path or ".", params.cwd or resolver.root)
+    # root = explicit path > request cwd, same cwd_not_set rule as the other
+    # tools; a relative cwd would otherwise resolve against the process cwd
+    full = resolver.locate(params.path or ".", params.cwd)
 
     # verify the target through its handle first: deny is matched against the
     # real resource AND the lexical one (a .env symlinked as good.txt is

@@ -1,7 +1,8 @@
 """glob tool — verified search root, deny exclusions, V2 rendering.
 
-The search root (explicit path, the request's cwd, or the workspace) is
-opened and verified through its handle before ripgrep sees it; rg then walks
+The search root (explicit path or the request's cwd -- there is no workspace
+fallback: a relative root with no cwd is ``cwd_not_set``, as everywhere else)
+is opened and verified through its handle before ripgrep sees it; rg then walks
 the verified real path. Deny patterns ride along as ``--glob=!`` exclusions.
 path_escape collapses into the generic message (V2 behavior) and is only
 logged server-side, so probing cannot map the server's filesystem.
@@ -43,10 +44,9 @@ def execute(
 def _run(
     resolver: Resolver, config: Config, params: GlobInput
 ) -> tuple[dict, str]:
-    # root = explicit path > request cwd > workspace. locate() is the only way
-    # in: it rejects poison and a relative cwd (which would otherwise resolve
-    # against the *process* cwd, since there is no path to join here).
-    full = resolver.locate(params.path or ".", params.cwd or resolver.root)
+    # root = explicit path > request cwd; no cwd is cwd_not_set, as everywhere
+    # else -- a search must not silently widen to the whole workspace
+    full = resolver.locate(params.path or ".", params.cwd)
 
     try:
         opened = resolver.open_checked(
