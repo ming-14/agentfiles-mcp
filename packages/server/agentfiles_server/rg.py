@@ -16,6 +16,12 @@ exits would otherwise block for as long as it likes.
 
 stderr is drained by a background thread from spawn time: a chatty rg would
 otherwise fill the pipe while we are still reading stdout and deadlock.
+
+A --json record is one line, and a minified file can put megabytes on one:
+rows are read in MAX_RECORD_BYTES steps, so a row that does not fit is never
+buffered whole. It is skipped, and the hit it carries is rebuilt from the
+parts that did fit -- one fat record costs its own submatches, never the rows
+around it and never the run.
 """
 
 from __future__ import annotations
@@ -33,7 +39,9 @@ from dataclasses import dataclass, field
 
 from agentfiles_shared.errors import ToolError
 
-MAX_RECORD_BYTES = 64 * 1024
+# one record is one --json line, and a minified file can put megabytes on a
+# single one: this caps what we are willing to parse, not what a hit may be
+MAX_RECORD_BYTES = 8 * 1024 * 1024
 MAX_SUBMATCHES = 100
 MAX_LINE_CHARS = 2_000
 ERROR_BYTES = 8 * 1024
@@ -197,12 +205,72 @@ def _check_exit(process: _Process, deadline: _Deadline, pattern: str) -> int:
     return code
 
 
+@dataclass
+class _Row:
+    """One row off rg's stdout.
+
+    ``raw`` is the whole row only when ``complete``; for a row that had to be
+    skipped it is the opening that was read on the way in. The line number
+    and offset are filled while the rest of the row goes past: they sit
+    after the matched line, which is the part that can be enormous.
+    """
+
+    raw: bytes
+    complete: bool
+    line_number: int | None = None
+    absolute_offset: int | None = None
+
+
+_LINE_NUMBER = re.compile(rb'"line_number":\s*(\d+)')
+_ABSOLUTE_OFFSET = re.compile(rb'"absolute_offset":\s*(\d+)')
+# a field can straddle two steps: keep this much of the previous one around
+_SCAN_OVERLAP = 64
+
+
+def _read_row(stdout, cap: int) -> _Row | None:
+    """Read one row in ``cap``-byte steps; None at EOF.
+
+    Iterating stdout would buffer a whole row, so a megabyte-long minified
+    line would be held in full no matter what the cap says. ``readline``
+    stops at the cap instead, and a row that reaches it without ending is
+    stepped over rather than collected.
+    """
+    head = stdout.readline(cap)
+    if not head:
+        return None
+    # a short read means EOF, so an unterminated last row is still whole
+    if head.endswith(b"\n") or len(head) < cap:
+        return _Row(raw=head, complete=True)
+    row = _Row(raw=head, complete=False)
+    _scan_fields(row, head)
+    behind = head[-_SCAN_OVERLAP:]
+    while True:
+        chunk = stdout.readline(cap)
+        if not chunk:
+            return row
+        _scan_fields(row, behind + chunk)
+        if chunk.endswith(b"\n") or len(chunk) < cap:
+            return row
+        behind = (behind + chunk)[-_SCAN_OVERLAP:]
+
+
+def _scan_fields(row: _Row, window: bytes) -> None:
+    if row.line_number is None:
+        found = _LINE_NUMBER.search(window)
+        if found:
+            row.line_number = int(found.group(1))
+    if row.absolute_offset is None:
+        found = _ABSOLUTE_OFFSET.search(window)
+        if found:
+            row.absolute_offset = int(found.group(1))
+
+
 def _collect(
     process: _Process,
     limit: int,
     timeout: float,
     pattern: str,
-    parse: Callable[[bytes], object | None],
+    parse: Callable[[_Row], object | None],
 ) -> RunResult:
     deadline = _Deadline.from_timeout(timeout)
     items: list = []
@@ -212,11 +280,14 @@ def _collect(
         nonlocal truncated
         assert process.handle.stdout is not None
         try:
-            for raw in process.handle.stdout:
+            while True:
                 if len(items) >= limit:
                     truncated = True
                     break
-                item = parse(raw)
+                row = _read_row(process.handle.stdout, MAX_RECORD_BYTES)
+                if row is None:
+                    break
+                item = parse(row)
                 if item is not None:
                     items.append(item)
         finally:
@@ -266,8 +337,11 @@ def run_glob(
     return _collect(_spawn(binary, args, cwd), limit, timeout, pattern, _parse_line)
 
 
-def _parse_line(raw: bytes) -> str | None:
-    line = raw.decode("utf-8", "replace").rstrip("\r\n")
+def _parse_line(row: _Row) -> str | None:
+    if not row.complete:
+        # a path cannot be this long; the opening of one is worse than nothing
+        return None
+    line = row.raw.decode("utf-8", "replace").rstrip("\r\n")
     return _strip_prefix(line) if line else None
 
 
@@ -313,13 +387,80 @@ def run_grep(
     return _collect(_spawn(binary, args, cwd), limit, timeout, pattern, _parse_record)
 
 
-def _parse_record(raw: bytes) -> RawMatch | None:
-    if len(raw) > MAX_RECORD_BYTES:
-        raise ToolError(
-            "rg_failed",
-            f"Ripgrep JSON record exceeded {MAX_RECORD_BYTES} bytes",
-        )
-    return _parse_match(raw.decode("utf-8", "replace"))
+def _parse_record(row: _Row) -> RawMatch | None:
+    if row.complete:
+        return _parse_match(row.raw.decode("utf-8", "replace"))
+    return _salvage(row)
+
+
+_BACKSLASH = 0x5C
+
+
+def _text_field(raw: bytes, key: bytes) -> str | None:
+    """The ``text`` of a ``"key":{"text":...}`` pair; None if the opening of
+    the record does not reach that far.
+
+    A salvaged record can be cut mid-string, so the closing quote is looked
+    for with ``find`` instead of a pattern that would back its way through
+    megabytes of text one byte at a time.
+    """
+    found = re.search(rb'"' + key + rb'":\s*\{\s*"text":\s*"', raw)
+    if found is None:
+        return None
+    start = found.end()
+    index = start
+    while True:
+        stop = raw.find(b'"', index)
+        if stop == -1:
+            return _unquote(raw[start:])
+        escaped = 0
+        probe = stop - 1
+        while probe >= start and raw[probe] == _BACKSLASH:
+            escaped += 1
+            probe -= 1
+        if escaped % 2 == 0:
+            return _unquote(raw[start:stop])
+        index = stop + 1
+
+
+# a cut can land inside an escape (`\u00`, a lone backslash): give back a few
+# bytes and try the shorter string before settling for the text as it is
+_UNQUOTE_RETRY = 8
+
+
+def _unquote(chunk: bytes) -> str:
+    text = chunk.decode("utf-8", "replace")
+    for end in range(len(text), max(len(text) - _UNQUOTE_RETRY, -1), -1):
+        try:
+            return json.loads('"' + text[:end] + '"')
+        except ValueError:
+            continue
+    return text
+
+
+def _salvage(row: _Row) -> RawMatch | None:
+    """The hit carried by a record too big to parse.
+
+    rg reports the whole matched line, so one minified line can put megabytes
+    in a single record -- and a submatch per match on it makes it worse. The
+    opening of the record still has the path and the start of the line, and
+    the numbers were read while the rest went past, so the hit comes back
+    like any other, preview bounded the same way. Submatches are lost: they
+    sit after the line, in the part that was skipped.
+    """
+    path = _text_field(row.raw, b"path")
+    text = _text_field(row.raw, b"lines")
+    if path is None or text is None:
+        return None
+    if row.line_number is None or row.absolute_offset is None:
+        return None
+    return RawMatch(
+        path=_strip_prefix(path),
+        line=row.line_number,
+        offset=row.absolute_offset,
+        text=_clip(text),
+        submatches=[],
+    )
 
 
 def validate_deny_globs(binary: str, patterns: list[str]) -> str | None:
@@ -340,6 +481,18 @@ def validate_deny_globs(binary: str, patterns: list[str]) -> str | None:
     return None
 
 
+def _clip(text: str) -> str:
+    """V2 bounds a preview line at 2000 chars and drops a torn surrogate pair
+    (a slice can split an astral character; avoid re for the lone-surrogate check)
+    """
+    if len(text) <= MAX_LINE_CHARS:
+        return text
+    text = text[:MAX_LINE_CHARS]
+    if text and 0xD800 <= ord(text[-1]) <= 0xDBFF:
+        text = text[:-1]
+    return text + "..."
+
+
 def _parse_match(line: str) -> RawMatch | None:
     """Parse one --json record; non-match rows are dropped."""
     try:
@@ -358,13 +511,7 @@ def _parse_match(line: str) -> RawMatch | None:
     if not isinstance(line_number, int) or not isinstance(offset, int):
         raise ToolError("rg_failed", "Invalid ripgrep match output")
 
-    # V2 bounds a preview line at 2000 chars and drops a torn surrogate pair
-    # (a slice can split a astral character; avoid re for the lone-surrogate check)
-    if len(text) > MAX_LINE_CHARS:
-        text = text[:MAX_LINE_CHARS]
-        if text and 0xD800 <= ord(text[-1]) <= 0xDBFF:
-            text = text[:-1]
-        text += "..."
+    text = _clip(text)
 
     submatches = []
     for item in (payload.get("submatches") or [])[:MAX_SUBMATCHES]:

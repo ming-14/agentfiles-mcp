@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -228,9 +229,25 @@ def test_noisy_stderr_does_not_deadlock(tmp_path):
     assert result.items == []
 
 
+def _match_record(path: str, text: str) -> bytes:
+    """One --json match row, in the shape rg emits for a hit."""
+    return json.dumps(
+        {
+            "type": "match",
+            "data": {
+                "path": {"text": path},
+                "lines": {"text": text},
+                "line_number": 1,
+                "absolute_offset": 0,
+                "submatches": [{"match": {"text": "needle"}, "start": 0, "end": 6}],
+            },
+        }
+    ).encode("utf-8")
+
+
 def test_parse_failure_kills_the_child(monkeypatch, tmp_path):
     """A record rg cannot parse used to leave the process running unreaped."""
-    fake = _fake_rg(tmp_path, b"x" * (rg.MAX_RECORD_BYTES + 1) + b"\n", sleep=5)
+    fake = _fake_rg(tmp_path, b"not json at all\n", sleep=5)
     spawned = []
     real_popen = subprocess.Popen
 
@@ -247,6 +264,41 @@ def test_parse_failure_kills_the_child(monkeypatch, tmp_path):
         )
     assert exc.value.code == "rg_failed"
     assert spawned and spawned[0].poll() is not None
+
+
+def test_oversized_record_costs_only_itself(monkeypatch, tmp_path):
+    """One record past the cap used to fail the whole search and discard every
+    row already collected. Now the run keeps going: a record that cannot be
+    made sense of is dropped, a real one is rebuilt from the parts that fit.
+    The line number sits after the matched line, so it has to be picked up
+    from the part that was skipped."""
+    monkeypatch.setattr(rg, "MAX_RECORD_BYTES", 400)
+    small = _match_record("a.txt", "needle here")
+    fat = _match_record("bundle.js", "needle" + "y" * 500)
+    fake = _fake_rg(tmp_path, b"\n".join([small, b"x" * 900, fat]) + b"\n")
+    result = rg.run_grep(
+        fake, cwd=str(tmp_path), pattern="needle", file=None, include=None,
+        limit=10, deny=[], timeout=10,
+    )
+    assert [match.path for match in result.items] == ["a.txt", "bundle.js"]
+    salvaged = result.items[1]
+    assert salvaged.line == 1
+    assert salvaged.text.startswith("needle" + "y" * 100)
+    # submatches sit after the line: the part that was skipped had them
+    assert salvaged.submatches == []
+
+
+def test_hit_on_a_minified_line_is_truncated_not_dropped(tmp_path):
+    """A minified file puts a whole bundle on one line: the hit has to survive,
+    bounded to the same preview any other long line gets."""
+    row = _match_record("bundle.js", "x" * 100_000)
+    fake = _fake_rg(tmp_path, row + b"\n")
+    result = rg.run_grep(
+        fake, cwd=str(tmp_path), pattern="needle", file=None, include=None,
+        limit=10, deny=[], timeout=15,
+    )
+    assert len(result.items) == 1
+    assert len(result.items[0].text) <= rg.MAX_LINE_CHARS + len("...")
 
 
 def test_truncated_ignores_a_signal_exit_code(binary, tree, monkeypatch):
