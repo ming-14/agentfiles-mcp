@@ -68,19 +68,37 @@ Headers:
 **cwd 与 workspace 是两个概念，而且只有后者是服务端内部的东西**：
 
 - **workspace** = 服务端配置的 `AF_WORKSPACE`，固定不变，安全边界。它只在服务端
-  内部起作用：containment 判定、以及解析 `set_cwd` 收到的相对输入。**不向客户端
-  暴露**，也没有任何端点能取到它
+  内部起作用：containment 判定、以及解析 `set_cwd` 收到的相对输入（客户端此刻还
+  没有 cwd，这是唯一可能的基准）。**没有端点专门报告它**——但 `set_cwd(".")` 返回
+  的就是它，`workspace` 工具随后会原样显示；而且 `read` 返回的 `uri` /
+  `version.path` 与 glob 的输出本身就是服务端绝对路径。所以「不暴露」只成立于
+  「没有专门的端点」，不等于「模型推不出它」
 - **cwd** = 客户端用 `POST /v1/cwd` 申请、服务端验证通过后返回的目录，由客户端
   自己保存并**每请求**附上（它不是服务端进程状态——服务端并发，绝不能 `chdir`），
   相对路径以它为基准。它被校验但**不被信任**：最终打开的文件自己会被句柄验证，
-  cwd 只影响「定位」。glob/grep 不传 `path` 时搜索根也取 cwd，
-  未设则回落到 workspace；`cwd` 不是绝对路径一律 `invalid_input`，绝不会退化成
-  进程自己的 cwd
+  cwd 只影响「定位」。glob/grep 不传 `path` 时搜索根也取 cwd，**五个工具一视
+  同仁**：未设 cwd 就是 `cwd_not_set`，不存在「悄悄回落到 workspace」这回事
+  （搜索根尤其不能悄悄放大到整个工作区）；`cwd` 不是绝对路径一律
+  `invalid_input`，绝不会退化成进程自己的 cwd
+
+`POST /v1/cwd` 本身也套 deny（读 deny 与写 deny 的**并集**）：任一策略命中的
+目录不能当基准，失败与 missing / 非目录 / 越界同一文案 `invalid_cwd`（回显模型
+自己的输入），所以加了 deny 之后能被 set_cwd 区分出的东西反而更少——被保护
+的目录现在和「不存在」长得一样
 
 MCP 侧流程：启动时 cwd 为空 → 相对路径请求被 `cwd_not_set` 拦截（不落任何默认
 基准）→ 模型调用 `set_cwd` → 客户端问服务端 `POST /v1/cwd`（打开目录句柄验证，
 返回内核真身路径）→ 客户端存下规范形 → 后续请求原样附上。`workspace` 工具可
 随时查看这个 cwd。
+
+**cwd 是「每个代理进程一个值」，不是会话级状态**：它存在 MCP 进程内存里，不落盘、
+不按会话隔离。同一进程内的并发调用、或多个模型共用一个代理进程时，`set_cwd`
+就是在改写别人相对路径的含义（实测两个会话交错时 55% 的相对读落到了对方的
+cwd 上）。单次请求**不会撕裂**——cwd 在任何 `await` 之前就烘进 payload 了；而
+回执表的键是 `(cwd, path)`，cwd 被改掉后写/编辑会拿不到回执，服务端回
+`version_missing` 要求重读（fail-closed，不会写错文件）。要彻底隔离就得给
+MCP 层引入会话维度，目前**不做**：宿主通常一个会话起一个 stdio 子进程，代价与
+复杂度暂不匹配。
 
 **目录列表与 ripgrep 是唯一的句柄级残留窗口**：Windows 无 fd 列目录（`os.listdir`
 不接受 int），列表用已验证的真身路径走一次；rg 收到的也是已验证的真身路径，
@@ -228,7 +246,7 @@ python -m agentfiles_server
 
 ```
 GET  /healthz                        探活（免签名）
-POST /v1/cwd          {path}         校验并返回 cwd 规范形（签名）
+POST /v1/cwd          {path}         校验（含 deny 并集）并返回 cwd 规范形（签名）
 POST /v1/read    {path, cwd?, offset?, limit?}
 POST /v1/write   {path, cwd?, content, expectedVersion?}
 POST /v1/edit    {path, cwd?, oldString, newString, replaceAll?, expectedVersion?}
@@ -291,6 +309,18 @@ POSIX 允许文件名含任意字节，Python 把无法解码的部分表示成 
 在 MCP stdio 上照样过不去：host 侧序列化请求时就会失败。文件内容本身不受影响，
 被改写的只有展示给模型的那部分文本。
 
+### 路径分隔符
+
+输入的 `\` 一律按 `/` 处理（`locate()` 入口归一化），所以模型按 Windows 习惯写
+的 `sub\hello.txt` 在 Linux 服务端同样能打开。这么做的另一半理由是一致性：
+输出侧（resource、glob/grep 的 modelText）本来就把 `\` 渲染成 `/`，deny 匹配也
+按 `/` 比对——只有定位不归一化的话，一个名字里真带 `\` 的文件会被「按字面打开、
+按 `/` 展示与判定」。
+
+代价就是那类名字：POSIX 上**名字里真的含反斜杠的文件不再可寻址**（它原本也只能
+按字面打开，而模型看到的展示名回读必然失败）。Windows 上不存在这个取舍——文件名
+不允许含 `\`，归一化前后等价。
+
 ## 本地 MCP
 
 环境变量：
@@ -321,16 +351,26 @@ POSIX 允许文件名含任意字节，Python 把无法解码的部分表示成 
 }
 ```
 
+**stderr 是这个进程唯一能写日志的地方**，而 stdout 是 JSON-RPC 通道。宿主若不
+抽干 stderr，管道一满子进程就卡在写日志上：不再读 stdin、不再应答，表现为「代理
+挂死」（Windows 匿名管道 4 KiB，实测第 37 次调用起不再应答；Linux 64 KiB，按
+112 字节/次推算约 585 次）。因此代理启动时把 `mcp` 与 `httpx` 两个 logger 提到 **WARNING**——SDK 的
+「Processing request of type …」和 httpx 的「HTTP Request: …」每次调用各一行
+INFO，实测 112 字节/次，没有任何价值却足以打死会话。WARNING 及以上照旧进 stderr
+（`configure_logging()` 只动 root logger，这两个显式级别不会被它改回去）。排障
+时把这两个 logger 开回 INFO 即可复现旧的详细输出。
+
 暴露 7 个 MCP 工具。五个文件工具带 `remote_` 前缀——它们操作的是**服务端**的
 文件系统，加前缀是为了不与宿主自带的同名本地文件工具撞名：
 `remote_read`、`remote_write`、`remote_edit`、`remote_glob`、`remote_grep`。
 另外两个是这套服务自身的概念，不带前缀：
 
-- **`workspace`** — 显示本客户端当前的 cwd（就是 `set_cwd` 设下的那个）
+- **`workspace`** — 显示本客户端当前的 cwd（就是 `set_cwd` 设下的那个）。相对
+  输入以 workspace 根为基准，所以 `set_cwd(".")` 之后这里显示的就是那个根
 - **`set_cwd(path)`** — 让服务端验证目录（打开句柄确认存在、是目录、在
-  containment 内），存下返回的规范形；成功后相对路径才可用。**失败不改变当前
-  cwd**，且 missing / 非目录 / 越界三种失败同一文案（`invalid_cwd`），模型无法
-  借它测绘服务端文件系统
+  containment 内、未被 deny 命中），存下返回的规范形；成功后相对路径才可用。
+  **失败不改变当前 cwd**，且 missing / 非目录 / 越界 / 被 deny 四种失败同一文案
+  （`invalid_cwd`），模型无法借它测绘服务端文件系统
 
 工具参数的描述与取值约束直接取自 `agentfiles_shared.schema` 的输入模型，
 MCP 输入 schema 与 REST 请求体校验是同一份定义，改一处两边同步生效。

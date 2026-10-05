@@ -201,8 +201,8 @@ async def workspace() -> str:
     against, set by set_cwd.
 
     Paths here are the server's namespace, not directories on your local
-    machine. The server's own workspace root -- what it resolves containment
-    against -- is not reported here.
+    machine. set_cwd resolves relative input against the server's workspace
+    root, so this can report that root.
     """
     return cwd_state.describe()
 
@@ -212,10 +212,12 @@ async def set_cwd(path: str) -> str:
     """Set the working directory for subsequent relative paths.
 
     The server validates the directory through a handle (must exist, be a
-    directory, and sit inside its workspace) and returns its resolved path;
-    only then is it stored. Absolute paths never need this. Starting state is
-    unset: a relative path sent before set_cwd fails with cwd_not_set rather
-    than resolving against an arbitrary default.
+    directory, sit inside its workspace, and not match its deny rules) and
+    returns its resolved path; only then is it stored. Absolute paths never
+    need this. Relative input resolves against the server's workspace root,
+    the only base there is before a cwd exists -- so set_cwd(".") yields that
+    root. Starting state is unset: a relative path sent before set_cwd fails
+    with cwd_not_set rather than resolving against an arbitrary default.
     """
     try:
         resolved = await client().set_cwd(path)
