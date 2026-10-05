@@ -641,6 +641,49 @@ def test_receipt_matches_content_under_a_concurrent_writer(client, workspace):
         thread.join(5)
 
 
+def test_undecodable_name_reaches_the_model_as_replacement(client, workspace):
+    """A name whose bytes are not valid UTF-8 comes off the filesystem as
+    surrogates, and no JSON response can encode those: rendering used to fail
+    after the route had returned, so the caller got a bare 500 instead of an
+    envelope. The name is shown with U+FFFD -- the spelling rg's byte output
+    already yields -- and the file's own bytes still read fine."""
+    if os.name != "posix":
+        pytest.skip("only POSIX filesystems hold names that are not UTF-8")
+
+    raw = os.path.join(os.fsencode(workspace), b"bad\xffutf8.txt")
+    try:
+        with open(raw, "wb") as fh:
+            fh.write(b"content\n")
+    except OSError:
+        pytest.skip("cannot create a non-UTF-8 name here")
+    name = os.fsdecode(b"bad\xffutf8.txt")
+
+    def post(payload: dict):
+        from agentfiles_shared.auth import build_headers
+
+        # the surrogate rides over the wire as \udcff; ensure_ascii=False
+        # could not encode it even to send it
+        body = json.dumps(payload, ensure_ascii=True).encode("utf-8")
+        headers = build_headers(
+            token=TOKEN, secret=SECRET, method="POST",
+            path="/v1/read", body=body,
+        ).as_dict()
+        headers["Content-Type"] = "application/json"
+        return client.post("/v1/read", content=body, headers=headers)
+
+    payload = {"path": name, "cwd": str(workspace)}
+    data = post(payload).json()
+    assert data["ok"] is True
+    assert data["result"]["content"] == "content\n"
+    assert data["result"]["name"] == "bad\ufffdutf8.txt"
+
+    listing = post({"path": ".", "cwd": str(workspace)}).json()
+    assert listing["ok"] is True
+    assert "bad\ufffdutf8.txt" in [
+        entry["path"] for entry in listing["result"]["entries"]
+    ]
+
+
 def test_filesystem_failure_reports_unable_to_read(client, workspace, monkeypatch):
     """An OSError on the read path (permission, vanished file, I/O error)
     becomes a tool error the model can act on -- never an `internal` one."""

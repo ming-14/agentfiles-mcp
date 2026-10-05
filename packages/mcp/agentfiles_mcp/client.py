@@ -124,7 +124,14 @@ class ToolClient:
         RemoteError for transport problems.
         """
         path = f"/v1/{tool}"
-        body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        try:
+            body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        except UnicodeEncodeError as exc:
+            # a path carrying undecodable bytes cannot go on the wire; encoding
+            # it lossily would silently address a different file
+            raise ToolError(
+                "invalid_input", "argument holds bytes that are not valid UTF-8"
+            ) from exc
         headers = build_headers(
             token=self._config.token,
             secret=self._config.secret,

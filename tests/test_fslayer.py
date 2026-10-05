@@ -15,7 +15,7 @@ import pytest
 
 from agentfiles_shared.errors import ToolError
 
-from agentfiles_server.fslayer import Resolver, contains, slash
+from agentfiles_server.fslayer import Resolver, contains, display_path, slash
 from agentfiles_server.handlepath import OPEN_RDONLY
 
 
@@ -285,6 +285,16 @@ def test_contains_rule(tmp_path: Path):
     assert contains(parent, parent)
     assert contains(parent, str(tmp_path / "a" / "b"))
     assert not contains(parent, str(tmp_path / ".."))
+
+
+def test_display_path_makes_undecodable_bytes_printable():
+    """Bytes that are not valid UTF-8 arrive as surrogates and cannot be
+    encoded into a response; decodable text is left exactly as it is."""
+    # spelled as an escape, not through os.fsdecode: on Windows that raises
+    # for these bytes, so the string is built the way POSIX listdir would
+    assert display_path("bad\udcffutf8.txt") == "bad\ufffdutf8.txt"
+    assert display_path("a.txt") == "a.txt"
+    assert display_path("日志/x.txt") == "日志/x.txt"
 
 
 def test_contains_cross_drive_is_false_not_error():

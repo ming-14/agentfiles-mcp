@@ -28,7 +28,7 @@ from agentfiles_shared.errors import ToolError, invalid_input, transport_too_lar
 from agentfiles_shared.transport import DOWNLOAD_PATH
 
 from .config import Config
-from .fslayer import Resolver
+from .fslayer import Resolver, display_path
 from .handlepath import OPEN_RDONLY
 from .readfs import mime_type
 
@@ -72,32 +72,35 @@ def download(resolver: Resolver, config: Config, raw_path: str):
     if not os.path.isabs(raw_path):
         return _error(invalid_input("path must be an absolute path"), status=400)
 
+    # messages quote the path, and a name may hold bytes no JSON response can
+    # encode; only the text the model sees is made printable
+    shown = display_path(raw_path)
     try:
         opened = resolver.open_checked(
             raw_path,
             flags=OPEN_RDONLY,
             expect="file",
             deny=config.read_deny,
-            on_deny=unable_to_read(raw_path),
+            on_deny=unable_to_read(shown),
         )
     except FileNotFoundError:
-        return _error(transport_unavailable(raw_path), status=404)
+        return _error(transport_unavailable(shown), status=404)
     except IsADirectoryError:
-        return _error(transport_unavailable(raw_path), status=404)
+        return _error(transport_unavailable(shown), status=404)
     except OSError:
-        return _error(transport_unavailable(raw_path), status=404)
+        return _error(transport_unavailable(shown), status=404)
     except ToolError as exc:
         if exc.code in ("path_escape", "path_kind"):
             # logged inside; same envelope as "missing" so the channel cannot
             # be used to map what lies outside the workspace
-            return _error(transport_unavailable(raw_path), status=404)
+            return _error(transport_unavailable(shown), status=404)
         return _error(exc, status=403)  # deny and other policy errors
 
     size = opened.stat.st_size
     if size > config.transport_max:
         opened.close()
         return _error(
-            transport_too_large(raw_path, size, config.transport_max), status=413
+            transport_too_large(shown, size, config.transport_max), status=413
         )
 
     return StreamingResponse(

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Callable
-from typing import TypeVar
+from typing import Any, TypeVar
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
@@ -22,7 +22,7 @@ from agentfiles_shared.schema import (
 )
 
 from .config import Config
-from .fslayer import Resolver
+from .fslayer import Resolver, display_path
 from .handlepath import OPEN_RDONLY
 from .middleware import AuthMiddleware, parse_body
 from .tools import edit, glob, grep, read, write
@@ -31,6 +31,24 @@ from .transport import download
 MAX_ERROR_DETAILS = 5
 
 InputModel = TypeVar("InputModel", bound=BaseModel)
+
+
+def _scrub(value: Any) -> Any:
+    """Walk a response body and make every string in it encodable."""
+    if isinstance(value, str):
+        return display_path(value)
+    if isinstance(value, list):
+        return [_scrub(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _scrub(item) for key, item in value.items()}
+    return value
+
+
+def _json(content: dict, status_code: int = 200) -> JSONResponse:
+    """Every response leaves through here: one undecodable byte in a name
+    would otherwise fail rendering after the route returned, and the caller
+    would see a bare 500 instead of an envelope."""
+    return JSONResponse(status_code=status_code, content=_scrub(content))
 
 
 def _validation_detail(exc: ValidationError) -> str:
@@ -75,28 +93,23 @@ def create_app(config: Config) -> FastAPI:
                     handler, resolver, config, params
                 )
             except ToolError as exc:
-                return JSONResponse(
-                    status_code=200,
-                    content={"ok": False, "error": exc.to_payload()},
-                )
+                return _json({"ok": False, "error": exc.to_payload()})
             except ValidationError as exc:
-                return JSONResponse(
-                    status_code=200,
-                    content={
+                return _json(
+                    {
                         "ok": False,
                         "error": invalid_input(_validation_detail(exc)).to_payload(),
-                    },
+                    }
                 )
             except Exception as exc:  # noqa: BLE001 - never leak internals to the model
-                return JSONResponse(
-                    status_code=200,
-                    content={
+                return _json(
+                    {
                         "ok": False,
                         "error": {"code": "internal", "message": f"Internal error: {exc.__class__.__name__}"},
-                    },
+                    }
                 )
-            return JSONResponse(
-                content={
+            return _json(
+                {
                     "ok": True,
                     "result": structured,
                     "modelText": model_text,
@@ -137,24 +150,19 @@ def create_app(config: Config) -> FastAPI:
             opened.close()
         except ToolError as exc:
             if exc.code == "invalid_input":
-                return JSONResponse(
-                    status_code=200, content={"ok": False, "error": exc.to_payload()}
-                )
-            return JSONResponse(
-                status_code=200,
-                content={"ok": False, "error": invalid_cwd(str(path)).to_payload()},
+                return _json({"ok": False, "error": exc.to_payload()})
+            return _json(
+                {"ok": False, "error": invalid_cwd(str(path)).to_payload()}
             )
         except ValueError as exc:
             # check_path_value (NUL / drive-relative)
-            return JSONResponse(
-                status_code=200,
-                content={"ok": False, "error": invalid_input(str(exc)).to_payload()},
+            return _json(
+                {"ok": False, "error": invalid_input(str(exc)).to_payload()}
             )
         except OSError:
-            return JSONResponse(
-                status_code=200,
-                content={"ok": False, "error": invalid_cwd(str(path)).to_payload()},
+            return _json(
+                {"ok": False, "error": invalid_cwd(str(path)).to_payload()}
             )
-        return JSONResponse(content={"ok": True, "cwd": opened.real})
+        return _json({"ok": True, "cwd": opened.real})
 
     return app
