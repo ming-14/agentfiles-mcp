@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from collections.abc import Callable
 from typing import Any, TypeVar
 
@@ -71,6 +70,9 @@ def create_app(config: Config) -> FastAPI:
     # Routes capture the resolver directly instead of reading it back off
     # app.state, so nothing depends on the ASGI lifespan having run.
     resolver = Resolver(config.workspace, config.external_whitelist)
+    # a cwd is the base for relative reads *and* writes, so a directory either
+    # deny list protects cannot serve as one
+    cwd_deny = list(dict.fromkeys(config.read_deny + config.write_deny))
     app = FastAPI(title="agentfiles-server")
     app.add_middleware(
         AuthMiddleware,
@@ -139,17 +141,20 @@ def create_app(config: Config) -> FastAPI:
         """Validate a working directory through a handle and return its
         kernel-resolved path. Relative input resolves against the workspace
         root (the client has no cwd yet -- that is what it is setting).
-        One error covers missing / not-a-directory / outside containment, so
-        set_cwd cannot be used to map the server's filesystem either."""
+        Both deny lists apply: a directory either policy protects cannot be
+        the base for relative paths. One error covers missing /
+        not-a-directory / outside containment / denied, so set_cwd cannot be
+        used to map the server's filesystem either."""
         try:
             body = parse_body(request)
             path = body.get("path")
             if not isinstance(path, str) or not path:
                 raise invalid_input("path must be a non-empty string")
             check_path_value(path)
-            full = path if os.path.isabs(path) else os.path.join(resolver.root, path)
+            full = resolver.locate(path, resolver.root)
             opened = resolver.open_checked(
-                os.path.normpath(full), flags=OPEN_RDONLY, expect="dir"
+                full, flags=OPEN_RDONLY, expect="dir",
+                deny=cwd_deny, on_deny=invalid_cwd(str(path)),
             )
             opened.close()
         except ToolError as exc:

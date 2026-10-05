@@ -130,6 +130,9 @@ class Resolver:
     def locate(self, path: str, cwd: str | None) -> str:
         """Full path to attempt opening. Raises cwd_not_set for a relative
         path with no working directory; makes no containment claim."""
+        # input is normalized like output: resource names, model text and deny
+        # matching already read '\' as '/' (see README, 路径分隔符)
+        path = path.replace("\\", "/")
         if os.path.isabs(path):
             return os.path.normpath(path)
         if not cwd:
