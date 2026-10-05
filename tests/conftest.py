@@ -19,6 +19,10 @@ from pathlib import Path
 
 import pytest
 
+# uid 0 ignores the permission bits: a 0o444 file is writable to root, so the
+# cases built on "this file cannot be written" have no premise there.
+IS_ROOT = os.geteuid() == 0 if hasattr(os, "geteuid") else False
+
 
 def _junction(target: str, link: str) -> bool:
     if os.name != "nt":

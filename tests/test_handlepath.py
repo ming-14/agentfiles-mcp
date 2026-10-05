@@ -14,6 +14,7 @@ import sys
 import pytest
 
 from agentfiles_server import handlepath
+from conftest import IS_ROOT
 
 
 def test_f_getpath_is_xnus_value():
@@ -57,6 +58,7 @@ def test_open_path_rejects_a_missing_file(tmp_path):
         handlepath.open_path(str(tmp_path / "nope.txt"), handlepath.OPEN_RDONLY)
 
 
+@pytest.mark.skipif(IS_ROOT, reason="root ignores the permission bits")
 def test_open_path_does_not_downgrade_a_read_only_file(tmp_path):
     """A read-only file must fail here, not come back as a read-only handle
     that passes the type check and only fails once we try to write."""

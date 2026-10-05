@@ -176,25 +176,21 @@ def test_expect_type_mismatch_is_path_kind(workspace: Path):
     assert exc.value.code == "path_kind"
 
 
-def test_devices_and_pipes_are_rejected(workspace: Path, tmp_path: Path):
+def test_devices_and_pipes_are_rejected(workspace: Path):
     """Only regular files and directories: a FIFO must not hang us, a device
     must not be touched."""
     if not hasattr(os, "mkfifo"):
         pytest.skip("no POSIX FIFOs on this platform")
-    fifo = tmp_path / "pipe"
+    # inside the workspace: containment runs on the handle's real path, so a
+    # FIFO outside it is rejected as an escape before the type rule is reached
+    fifo = workspace / "pipe"
     try:
         os.mkfifo(str(fifo))
     except (OSError, NotImplementedError):
         pytest.skip("mkfifo unavailable on this platform")
-    # symlink it into the workspace so containment passes and TYPE is the rule
-    link = workspace / "pipe"
-    try:
-        os.symlink(str(fifo), str(link))
-    except (OSError, NotImplementedError):
-        pytest.skip("symlinks unavailable on this platform")
     resolver = Resolver(str(workspace))
     with pytest.raises(ToolError) as exc:
-        open_ok(resolver, str(link))
+        open_ok(resolver, str(fifo))
     assert exc.value.code == "path_kind"
 
 

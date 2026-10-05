@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 
 from agentfiles_server.app import create_app
 from agentfiles_server.config import Config
+from conftest import IS_ROOT
 
 TOKEN = "tok-e"
 SECRET = "sec-e"
@@ -319,6 +320,7 @@ def test_consecutive_edits_use_refreshed_version(workspace):
 
 # --- filesystem failures -----------------------------------------------------
 
+@pytest.mark.skipif(IS_ROOT, reason="root ignores the permission bits")
 def test_readonly_file_reports_unable_to_edit(workspace):
     """os.open(O_RDWR) on a read-only file raises PermissionError on both
     platforms; it must reach the model as a tool error, not as `internal`."""

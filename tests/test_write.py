@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 
 from agentfiles_server.app import create_app
 from agentfiles_server.config import Config
+from conftest import IS_ROOT
 
 TOKEN = "tok-w"
 SECRET = "sec-w"
@@ -274,6 +275,7 @@ def test_empty_content(workspace):
 
 # --- filesystem failures -----------------------------------------------------
 
+@pytest.mark.skipif(IS_ROOT, reason="root ignores the permission bits")
 def test_readonly_file_reports_unable_to_write(workspace):
     """os.open(O_RDWR) raises PermissionError (not IsADirectoryError) on
     Windows and for any read-only file; it must not leak as `internal`."""
